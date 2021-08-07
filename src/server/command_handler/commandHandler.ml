@@ -20,11 +20,11 @@ let type_parse_artifacts_with_cache
     ~options ~env ~profiling ~type_parse_artifacts_cache file artifacts =
   match type_parse_artifacts_cache with
   | None ->
-    let%lwt result = Types_js.type_parse_artifacts ~options ~env ~profiling file artifacts in
+    let%lwt result = Type_contents.type_parse_artifacts ~options ~env ~profiling file artifacts in
     Lwt.return (result, None)
   | Some cache ->
     let lazy_result =
-      lazy (Types_js.type_parse_artifacts ~options ~env ~profiling file artifacts)
+      lazy (Type_contents.type_parse_artifacts ~options ~env ~profiling file artifacts)
     in
     let%lwt (result, did_hit) = FilenameCache.with_cache file lazy_result cache in
     Lwt.return (result, Some did_hit)
@@ -138,8 +138,8 @@ let autocomplete
   in
   Autocomplete_js.autocomplete_set_hooks ~cursor:cursor_loc;
   let%lwt file_artifacts_result =
-    let%lwt parse_result = Types_js.parse_contents ~options ~profiling contents path in
-    Types_js.type_parse_artifacts ~options ~env ~profiling path parse_result
+    let%lwt parse_result = Type_contents.parse_contents ~options ~profiling contents path in
+    Type_contents.type_parse_artifacts ~options ~env ~profiling path parse_result
   in
   Autocomplete_js.autocomplete_unset_hooks ();
   let initial_json_props =
@@ -250,15 +250,15 @@ let check_file ~options ~env ~profiling ~force file_input =
     if should_check then
       let%lwt result =
         let%lwt ((_, parse_errs) as intermediate_result) =
-          Types_js.parse_contents ~options ~profiling content file
+          Type_contents.parse_contents ~options ~profiling content file
         in
         if not (Flow_error.ErrorSet.is_empty parse_errs) then
           Lwt.return (Error parse_errs)
         else
-          Types_js.type_parse_artifacts ~options ~env ~profiling file intermediate_result
+          Type_contents.type_parse_artifacts ~options ~env ~profiling file intermediate_result
       in
       let (errors, warnings) =
-        Types_js.printable_errors_of_file_artifacts_result ~options ~env file result
+        Type_contents.printable_errors_of_file_artifacts_result ~options ~env file result
       in
       Lwt.return (convert_errors ~errors ~warnings ~suppressed_errors:[])
     else
@@ -332,7 +332,7 @@ let infer_type
     let%lwt result =
       try_with_json (fun () ->
           let%lwt (file_artifacts_result, did_hit_cache) =
-            let%lwt parse_result = Types_js.parse_contents ~options ~profiling content file in
+            let%lwt parse_result = Type_contents.parse_contents ~options ~profiling content file in
             type_parse_artifacts_with_cache
               ~options
               ~env
@@ -527,8 +527,8 @@ let dump_types ~options ~env ~profiling ~expand_aliases ~evaluate_type_destructo
       let file = File_key.SourceFile file in
       Lwt.return (File_input.content_of_file_input file_input) >>= fun content ->
       let%lwt file_artifacts_result =
-        let%lwt parse_result = Types_js.parse_contents ~options ~profiling content file in
-        Types_js.type_parse_artifacts ~options ~env ~profiling file parse_result
+        let%lwt parse_result = Type_contents.parse_contents ~options ~profiling content file in
+        Type_contents.type_parse_artifacts ~options ~env ~profiling file parse_result
       in
       match file_artifacts_result with
       | Error _parse_errors -> Lwt.return (Error "Couldn't parse file in parse_contents")
@@ -557,7 +557,9 @@ let coverage ~options ~env ~profiling ~type_parse_artifacts_cache ~force ~trust 
       let%lwt result =
         try_with_json (fun () ->
             let%lwt (file_artifacts_result, did_hit_cache) =
-              let%lwt parse_result = Types_js.parse_contents ~options ~profiling content file in
+              let%lwt parse_result =
+                Type_contents.parse_contents ~options ~profiling content file
+              in
               type_parse_artifacts_with_cache
                 ~options
                 ~env
@@ -725,7 +727,7 @@ let get_def ~options ~reader ~env ~profiling ~type_parse_artifacts_cache (file_i
     | Error _ as err -> Lwt.return (err, None)
     | Ok content ->
       (match%lwt
-         let%lwt parse_result = Types_js.parse_contents ~options ~profiling content file in
+         let%lwt parse_result = Type_contents.parse_contents ~options ~profiling content file in
          type_parse_artifacts_with_cache
            ~options
            ~env
@@ -999,22 +1001,25 @@ let handle_save_state ~saved_state_filename ~genv ~profiling ~env =
   Lwt.return (env, ServerProt.Response.SAVE_STATE result, None)
 
 let find_code_actions ~reader ~options ~env ~profiling ~params ~client =
-  let CodeActionRequest.{ textDocument; range; context = { only = _; diagnostics } } = params in
-  let file_input = file_input_of_text_document_identifier ~client textDocument in
-  let file_key = File_key.SourceFile (File_input.filename_of_file_input file_input) in
-  let loc = Flow_lsp_conversions.lsp_range_to_flow_loc ~source:file_key range in
-  match File_input.content_of_file_input file_input with
-  | Error msg -> Lwt.return (Error msg)
-  | Ok file_contents ->
-    if not (Code_action_service.client_supports_quickfixes params) then
-      Lwt.return (Ok [])
-    else
+  let CodeActionRequest.{ textDocument; range; context = { only; diagnostics } } = params in
+  if not (Code_action_service.kind_is_supported ~options only) then
+    (* bail out early if we don't support any of the code actions requested *)
+    Lwt.return (Ok [])
+  else
+    let file_input = file_input_of_text_document_identifier ~client textDocument in
+    let file_key = File_key.SourceFile (File_input.filename_of_file_input file_input) in
+    let loc = Flow_lsp_conversions.lsp_range_to_flow_loc ~source:file_key range in
+    match File_input.content_of_file_input file_input with
+    | Error msg -> Lwt.return (Error msg)
+    | Ok file_contents ->
       let type_parse_artifacts_cache =
         Some (Persistent_connection.type_parse_artifacts_cache client)
       in
       let uri = TextDocumentIdentifier.(textDocument.uri) in
       let%lwt (file_artifacts_result, _did_hit_cache) =
-        let%lwt parse_result = Types_js.parse_contents ~options ~profiling file_contents file_key in
+        let%lwt parse_result =
+          Type_contents.parse_contents ~options ~profiling file_contents file_key
+        in
         type_parse_artifacts_with_cache
           ~options
           ~env
@@ -1028,8 +1033,10 @@ let find_code_actions ~reader ~options ~env ~profiling ~params ~client =
       | Ok
           ( Parse_artifacts { file_sig; tolerable_errors; ast; parse_errors; _ },
             Typecheck_artifacts { cx; typed_ast } ) ->
+        let lsp_init_params = Persistent_connection.lsp_initialize_params client in
         Code_action_service.code_actions_at_loc
           ~options
+          ~lsp_init_params
           ~env
           ~reader
           ~cx
@@ -1039,8 +1046,36 @@ let find_code_actions ~reader ~options ~env ~profiling ~params ~client =
           ~typed_ast
           ~parse_errors
           ~diagnostics
+          ~only
           ~uri
           ~loc)
+
+let add_missing_imports ~reader ~options ~env ~profiling ~client textDocument =
+  let file_input = file_input_of_text_document_identifier ~client textDocument in
+  let file_key = File_key.SourceFile (File_input.filename_of_file_input file_input) in
+  match File_input.content_of_file_input file_input with
+  | Error msg -> Lwt.return (Error msg)
+  | Ok file_contents ->
+    let type_parse_artifacts_cache =
+      Some (Persistent_connection.type_parse_artifacts_cache client)
+    in
+    let uri = TextDocumentIdentifier.(textDocument.uri) in
+    let%lwt (file_artifacts_result, _did_hit_cache) =
+      let%lwt parse_result =
+        Type_contents.parse_contents ~options ~profiling file_contents file_key
+      in
+      type_parse_artifacts_with_cache
+        ~options
+        ~env
+        ~profiling
+        ~type_parse_artifacts_cache
+        file_key
+        parse_result
+    in
+    (match file_artifacts_result with
+    | Error _ -> Lwt.return (Ok [])
+    | Ok (Parse_artifacts { ast; _ }, Typecheck_artifacts { cx; typed_ast = _ }) ->
+      Lwt.return (Ok (Code_action_service.autofix_imports ~options ~env ~reader ~cx ~ast ~uri)))
 
 type command_handler =
   (* A command can be handled immediately if it is super duper fast and doesn't require the env.
@@ -1788,7 +1823,7 @@ let handle_persistent_signaturehelp_lsp
     in
     let path = File_key.SourceFile path in
     let%lwt (file_artifacts_result, did_hit_cache) =
-      let%lwt parse_result = Types_js.parse_contents ~options ~profiling contents path in
+      let%lwt parse_result = Type_contents.parse_contents ~options ~profiling contents path in
       let type_parse_artifacts_cache =
         Some (Persistent_connection.type_parse_artifacts_cache client)
       in
@@ -2160,29 +2195,53 @@ let handle_persistent_rage ~reader ~genv ~id ~metadata ~client:_ ~profiling ~env
   let response = ResponseMessage (id, RageResult items) in
   Lwt.return ((), LspProt.LspFromServer (Some response), metadata)
 
-let handle_persistent_execute_command ~id ~params ~metadata ~client:_ ~profiling:_ =
-  let ExecuteCommand.{ command = Command.Command command; arguments } = params in
-  let extra_data =
-    let open Hh_json in
-    let arguments_json =
-      match arguments with
-      | None -> JSON_Null
-      | Some jsons -> JSON_Array jsons
-    in
-    Some (JSON_Object [("command", JSON_String command); ("arguments", arguments_json)])
-  in
-  match command with
-  | "log" ->
+let handle_persistent_log_command ~id ~metadata ~arguments:_ ~client:_ ~profiling:_ =
+  (* don't need to do anything, since everything we need to log is already in `metadata` *)
+  Lwt.return
+    ((), LspProt.LspFromServer (Some (ResponseMessage (id, ExecuteCommandResult ()))), metadata)
+
+let handle_persistent_add_missing_imports_command
+    ~reader ~options ~id ~metadata ~textDocument ~client ~profiling ~env =
+  let%lwt edits = add_missing_imports ~reader ~options ~env ~profiling ~client textDocument in
+  match edits with
+  | Error reason -> mk_lsp_error_response ~ret:() ~id:(Some id) ~reason metadata
+  | Ok [] ->
+    (* nothing to do, return immediately *)
     Lwt.return
-      ( (),
-        LspProt.LspFromServer (Some (ResponseMessage (id, ExecuteCommandResult ()))),
-        with_data ~extra_data metadata )
-  | _ ->
-    mk_lsp_error_response
-      ~ret:()
-      ~id:(Some id)
-      ~reason:"Malformed command"
-      (with_data ~extra_data metadata)
+      ((), LspProt.LspFromServer (Some (ResponseMessage (id, ExecuteCommandResult ()))), metadata)
+  | Ok edits ->
+    (* send a workspace/applyEdit command to the client. when it replies, we'll reply to the command *)
+    let req_id =
+      let prefix =
+        match id with
+        | Lsp.NumberId id -> string_of_int id
+        | Lsp.StringId id -> id
+      in
+      Lsp.StringId (spf "%s:applyEdit" prefix)
+    in
+    let uri = TextDocumentIdentifier.(textDocument.uri) in
+    let edit = { WorkspaceEdit.changes = Lsp.UriMap.singleton uri edits } in
+    let request =
+      RequestMessage
+        ( req_id,
+          ApplyWorkspaceEditRequest { ApplyWorkspaceEdit.label = Some "Add missing imports"; edit }
+        )
+    in
+    let handler =
+      ApplyWorkspaceEditHandler
+        (fun _result () ->
+          (* respond to original executeCommand *)
+          let response = ResponseMessage (id, ExecuteCommandResult ()) in
+          Persistent_connection.send_response
+            (LspProt.LspFromServer (Some response), metadata)
+            client)
+    in
+    let on_error _ () = (* TODO send error to client *) () in
+    Persistent_connection.push_outstanding_handler client req_id (handler, on_error);
+    Lwt.return ((), LspProt.LspFromServer (Some request), metadata)
+
+let handle_persistent_malformed_command ~id ~metadata ~client:_ ~profiling:_ =
+  mk_lsp_error_response ~ret:() ~id:(Some id) ~reason:"Malformed command" metadata
 
 let handle_persistent_unsupported ?id ~unhandled ~metadata ~client:_ ~profiling:_ =
   let message = Printf.sprintf "Unhandled method %s" (Lsp_fmt.message_name_to_string unhandled) in
@@ -2196,6 +2255,16 @@ let handle_persistent_unsupported ?id ~unhandled ~metadata ~client:_ ~profiling:
         (TelemetryNotification { LogMessage.type_ = MessageType.ErrorMessage; message })
   in
   Lwt.return ((), LspProt.LspFromServer (Some response), metadata)
+
+let handle_result_from_client ~id ~metadata ~(result : Lsp.lsp_result) ~client ~profiling:_ =
+  (match Persistent_connection.pop_outstanding_handler client id with
+  | Some (handler, handle_error) ->
+    (match (result, handler) with
+    | (ApplyWorkspaceEditResult result, ApplyWorkspaceEditHandler handle) -> handle result ()
+    | (ErrorResult (e, msg), _) -> handle_error (e, msg) ()
+    | _ -> ())
+  | None -> ());
+  Lwt.return ((), LspProt.LspFromServer None, metadata)
 
 (* What should we do if we get multiple requests for the same URI? Each request wants the most
  * up-to-date live errors, so if we have 10 pending requests then we would want to send the same
@@ -2262,7 +2331,7 @@ let handle_live_errors_request =
                 in
                 let%lwt (result, did_hit_cache) =
                   let%lwt ((_, parse_errs) as intermediate_result) =
-                    Types_js.parse_contents ~options ~profiling content file_key
+                    Type_contents.parse_contents ~options ~profiling content file_key
                   in
                   if not (Flow_error.ErrorSet.is_empty parse_errs) then
                     Lwt.return (Error parse_errs, None)
@@ -2279,7 +2348,11 @@ let handle_live_errors_request =
                       intermediate_result
                 in
                 let (live_errors, live_warnings) =
-                  Types_js.printable_errors_of_file_artifacts_result ~options ~env file_key result
+                  Type_contents.printable_errors_of_file_artifacts_result
+                    ~options
+                    ~env
+                    file_key
+                    result
                 in
                 let metadata =
                   let json_props = add_cache_hit_data_to_json [] did_hit_cache in
@@ -2498,7 +2571,36 @@ let get_persistent_handler ~genv ~client_id ~request:(request, metadata) :
     (* Whoever is waiting for the rage results probably doesn't want to wait for a recheck *)
     mk_parallelizable_persistent ~options (handle_persistent_rage ~reader ~genv ~id ~metadata)
   | LspToServer (RequestMessage (id, ExecuteCommandRequest params)) ->
-    Handle_persistent_immediately (handle_persistent_execute_command ~id ~params ~metadata)
+    let ExecuteCommand.{ command = Command.Command command; arguments } = params in
+    let extra_data =
+      let open Hh_json in
+      let arguments_json =
+        match arguments with
+        | None -> JSON_Null
+        | Some jsons -> JSON_Array jsons
+      in
+      Some (JSON_Object [("command", JSON_String command); ("arguments", arguments_json)])
+    in
+    let metadata = with_data ~extra_data metadata in
+    (match command with
+    | "log" ->
+      Handle_persistent_immediately (handle_persistent_log_command ~id ~arguments ~metadata)
+    | "source.addMissingImports" ->
+      (match arguments with
+      | Some [json] ->
+        let textDocument = Lsp_fmt.parse_textDocumentIdentifier (Some json) in
+        mk_parallelizable_persistent
+          ~options
+          (handle_persistent_add_missing_imports_command
+             ~reader
+             ~options
+             ~id
+             ~metadata
+             ~textDocument)
+      | _ -> Handle_persistent_immediately (handle_persistent_malformed_command ~id ~metadata))
+    | _ -> Handle_persistent_immediately (handle_persistent_malformed_command ~id ~metadata))
+  | LspToServer (ResponseMessage (id, result)) ->
+    Handle_persistent_immediately (handle_result_from_client ~id ~result ~metadata)
   | LspToServer unhandled ->
     let id =
       match unhandled with

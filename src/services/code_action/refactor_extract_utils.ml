@@ -9,21 +9,230 @@ module Scope_api = Scope_api.With_Loc
 module Ssa_api = Ssa_api.With_Loc
 open Loc_collections
 
+module InsertionPointCollectors = struct
+  type function_insertion_point = {
+    function_name: string;
+    body_loc: Loc.t;
+    is_method: bool;
+    tparams_rev: Type.typeparam list;
+  }
+
+  type class_insertion_point = {
+    class_name: string option;
+    body_loc: Loc.t;
+    tparams_rev: Type.typeparam list;
+  }
+
+  let not_this_typeparam { Type.is_this; _ } = not is_this
+
+  class virtual ['M, 'N] function_and_method_insertion_point_visitor =
+    object (this)
+      inherit ['M, 'N, 'M, 'N] Flow_polymorphic_ast_mapper.mapper as super
+
+      method on_loc_annot x = x
+
+      method on_type_annot x = x
+
+      method virtual visit_named_function
+          : is_method:bool -> function_name:string -> body_loc:'M -> unit
+
+      method private function_with_name ?name ?(is_method = false) function_declaration =
+        let open Flow_ast in
+        match function_declaration with
+        | { Function.id; body = Function.BodyBlock (block_loc, _); tparams; _ } ->
+          (match (id, name) with
+          | (None, None) -> ()
+          | (Some (_, { Identifier.name; _ }), _)
+          | (None, Some (_, { Identifier.name; _ })) ->
+            this#type_params_opt tparams (fun _ ->
+                this#visit_named_function ~is_method ~function_name:name ~body_loc:block_loc))
+        | _ -> ()
+
+      method! function_ function_declaration =
+        let () = this#function_with_name function_declaration in
+        super#function_ function_declaration
+
+      method! variable_declarator ~kind decl =
+        let open Flow_ast in
+        let (_, { Statement.VariableDeclaration.Declarator.id; init }) = decl in
+        match (id, init) with
+        | ( (_, Pattern.Identifier { Pattern.Identifier.name; _ }),
+            Some (_, (Expression.ArrowFunction f | Expression.Function f)) ) ->
+          let () = this#function_with_name ~name f in
+          super#variable_declarator ~kind decl
+        | _ -> super#variable_declarator ~kind decl
+
+      method! class_property property =
+        let open Flow_ast in
+        let { Class.Property.key; value; _ } = property in
+        let () =
+          match (key, value) with
+          | ( Expression.Object.Property.Identifier name,
+              Class.Property.Initialized (_, (Expression.ArrowFunction f | Expression.Function f))
+            ) ->
+            this#function_with_name ~name ~is_method:true f
+          | _ -> ()
+        in
+        super#class_property property
+
+      method! class_method meth =
+        let open Flow_ast in
+        let { Class.Method.key; value = (_, f); _ } = meth in
+        let () =
+          match key with
+          | Expression.Object.Property.Identifier name ->
+            this#function_with_name ~name ~is_method:true f
+          | _ -> ()
+        in
+        super#class_method meth
+    end
+
+  class function_and_method_insertion_point_collector reader extracted_loc =
+    object (this)
+      inherit Typed_ast_utils.type_parameter_mapper as type_parameter_mapper
+
+      inherit! [ALoc.t, ALoc.t * Type.t] function_and_method_insertion_point_visitor
+
+      (* Override the following methods from type_parameter_mapper back *)
+
+      method! type_param = type_parameter_mapper#type_param
+
+      method! type_params_opt = type_parameter_mapper#type_params_opt
+
+      method! class_ = type_parameter_mapper#class_
+
+      val mutable acc = []
+
+      method visit_named_function ~is_method ~function_name ~body_loc =
+        let body_loc = Parsing_heaps.Reader.loc_of_aloc ~reader body_loc in
+        if Loc.contains body_loc extracted_loc then
+          this#collect_name_and_loc ~is_method function_name body_loc |> this#annot_with_tparams
+
+      method collect_name_and_loc ~tparams_rev ?(is_method = false) function_name body_loc =
+        acc <-
+          {
+            function_name;
+            body_loc;
+            is_method;
+            (* Flow models `this` parameter as a generic parameter with bound, so it will appear in
+               the typeparam list. However, that is not necessary for the refactor purpose, since we
+               will never produce `this` annotations. *)
+            tparams_rev = List.filter not_this_typeparam tparams_rev;
+          }
+          :: acc
+
+      method function_inserting_locs_with_typeparams typed_ast =
+        let _ = this#program typed_ast in
+        acc
+    end
+
+  let collect_function_method_inserting_points ~typed_ast ~reader ~extracted_loc =
+    let collector = new function_and_method_insertion_point_collector reader extracted_loc in
+    collector#function_inserting_locs_with_typeparams typed_ast
+
+  class class_insertion_point_collector reader extracted_loc =
+    object (this)
+      inherit Typed_ast_utils.type_parameter_mapper as super
+
+      val mutable acc = None
+
+      method private collect_name_and_loc ~tparams_rev class_name body_loc =
+        acc <-
+          Some { class_name; body_loc; tparams_rev = List.filter not_this_typeparam tparams_rev }
+
+      method closest_enclosing_class_scope typed_ast =
+        let _ = this#program typed_ast in
+        acc
+
+      method! class_ class_declaration =
+        let open Flow_ast in
+        let { Class.id; body = (body_aloc, _); tparams; _ } = class_declaration in
+        let body_loc = Parsing_heaps.Reader.loc_of_aloc ~reader body_aloc in
+        if Loc.contains extracted_loc body_loc then
+          (* When the class is nested inside the extracted statements, we stop recursing down. *)
+          class_declaration
+        else if Loc.contains body_loc extracted_loc then
+          let id =
+            match id with
+            | None -> None
+            | Some (_, { Identifier.name; _ }) -> Some name
+          in
+          let () =
+            this#type_params_opt tparams (fun _ ->
+                this#collect_name_and_loc id body_loc |> this#annot_with_tparams)
+          in
+          super#class_ class_declaration
+        else
+          super#class_ class_declaration
+    end
+
+  let find_closest_enclosing_class ~typed_ast ~reader ~extracted_loc =
+    let collector = new class_insertion_point_collector reader extracted_loc in
+    collector#closest_enclosing_class_scope typed_ast
+end
+
 module AstExtractor = struct
+  type constant_insertion_point = {
+    title: string;
+    function_body_loc: Loc.t option;
+    statement_loc: Loc.t;
+  }
+  [@@deriving show]
+
+  type expression_with_constant_insertion_points = {
+    constant_insertion_points: constant_insertion_point Nel.t;
+    expression: (Loc.t, Loc.t) Flow_ast.Expression.t;
+  }
+
+  type type_with_statement_loc = {
+    directly_containing_statement_loc: Loc.t;
+    type_: (Loc.t, Loc.t) Flow_ast.Type.t;
+  }
+
   type extracted = {
     extracted_statements: (Loc.t, Loc.t) Flow_ast.Statement.t list option;
-    extracted_expression: (Loc.t, Loc.t) Flow_ast.Expression.t option;
+    extracted_expression: expression_with_constant_insertion_points option;
+    extracted_type: type_with_statement_loc option;
   }
 
   (* Collect all statements that are completely within the selection.
      Collect a single expression that is completely within the selection. *)
   class collector (extract_range : Loc.t) =
     object (this)
-      inherit [Loc.t] Flow_ast_mapper.mapper as super
+      inherit
+        [Loc.t, Loc.t] InsertionPointCollectors.function_and_method_insertion_point_visitor as super
+
+      val mutable constant_insertion_points =
+        Nel.one
+          {
+            title = "Extract to constant in module scope";
+            function_body_loc = None;
+            statement_loc = Loc.none;
+          }
 
       val mutable collect_statement = true
 
       val mutable collected_expression = None
+
+      val mutable collected_type = None
+
+      method visit_named_function ~is_method ~function_name ~body_loc =
+        if Loc.contains body_loc extract_range then
+          constant_insertion_points <-
+            Nel.cons
+              {
+                title =
+                  Printf.sprintf
+                    "Extract to constant in %s '%s'"
+                    (if is_method then
+                      "method"
+                    else
+                      "function")
+                    function_name;
+                function_body_loc = Some body_loc;
+                statement_loc = Loc.none;
+              }
+              constant_insertion_points
 
       (* `Some collected_statements`
          `None` when extraction is not allowed based on user selection. *)
@@ -36,7 +245,11 @@ module AstExtractor = struct
           | Some [] -> None
           | Some collected_statements -> Some (List.rev collected_statements)
         in
-        { extracted_statements; extracted_expression = collected_expression }
+        {
+          extracted_statements;
+          extracted_expression = collected_expression;
+          extracted_type = collected_type;
+        }
 
       method private collect_statement stmt =
         _collected_statements <-
@@ -46,36 +259,49 @@ module AstExtractor = struct
 
       method! statement stmt =
         let (statement_loc, stmt') = stmt in
-        if Loc.contains extract_range statement_loc then
-          let () = this#collect_statement stmt in
-          (* If the statement is already completely contained in the range,
-             do not recursve deeper to collect more nested ones,
-             except for the special case when the statement is an expression statement. *)
-          let () =
-            match stmt' with
-            | Flow_ast.Statement.Expression { Flow_ast.Statement.Expression.expression; _ } ->
-              if fst expression = statement_loc then collected_expression <- Some expression
-            | _ -> ()
-          in
-          stmt
-        else if Loc.contains statement_loc extract_range then
-          (* If the range is completely contained in the statement,
-             we should recursve deeper to find smaller nested statements/expressions that are
-             contained in the range. *)
-          super#statement stmt
-        else if Loc.intersects extract_range statement_loc then
-          (* When there is intersection, it means that the selection is not allowed for extraction. *)
-          let () = _collected_statements <- None in
-          stmt
-        else
-          (* If disjoint, the statement and nested ones do not need to be collected. *)
-          stmt
+        let saved_constant_insertion_points = constant_insertion_points in
+        let () =
+          constant_insertion_points <-
+            (let ({ title; function_body_loc; _ }, constant_insertion_points) =
+               constant_insertion_points
+             in
+             ({ title; function_body_loc; statement_loc }, constant_insertion_points))
+        in
+        let result =
+          if Loc.contains extract_range statement_loc then
+            let () = this#collect_statement stmt in
+            (* If the statement is already completely contained in the range,
+               do not recursve deeper to collect more nested ones,
+               except for the special case when the statement is an expression statement. *)
+            let () =
+              match stmt' with
+              | Flow_ast.Statement.Expression { Flow_ast.Statement.Expression.expression; _ } ->
+                if fst expression = statement_loc then
+                  collected_expression <- Some { constant_insertion_points; expression }
+              | _ -> ()
+            in
+            stmt
+          else if Loc.contains statement_loc extract_range then
+            (* If the range is completely contained in the statement,
+               we should recursve deeper to find smaller nested statements/expressions that are
+               contained in the range. *)
+            super#statement stmt
+          else if Loc.intersects extract_range statement_loc then
+            (* When there is intersection, it means that the selection is not allowed for extraction. *)
+            let () = _collected_statements <- None in
+            stmt
+          else
+            (* If disjoint, the statement and nested ones do not need to be collected. *)
+            stmt
+        in
+        let () = constant_insertion_points <- saved_constant_insertion_points in
+        result
 
       method! expression expr =
         let (expression_loc, _) = expr in
         if Loc.equal extract_range expression_loc then
           (* Only collect expression when the selection is an exact match. *)
-          let () = collected_expression <- Some expr in
+          let () = collected_expression <- Some { constant_insertion_points; expression = expr } in
           expr
         else if Loc.contains expression_loc extract_range then
           (* If the range is completely contained in the expression,
@@ -85,6 +311,24 @@ module AstExtractor = struct
         else
           (* In all other cases, selection is illegal. *)
           expr
+
+      method! type_ t =
+        let (type_loc, _) = t in
+        if Loc.equal extract_range type_loc then
+          (* Only collect type when the selection is an exact match. *)
+          let ({ statement_loc; _ }, _) = constant_insertion_points in
+          let () =
+            collected_type <- Some { directly_containing_statement_loc = statement_loc; type_ = t }
+          in
+          t
+        else if Loc.contains type_loc extract_range then
+          (* If the range is completely contained in the type,
+             we should recursve deeper to find smaller nested types that are contained in the
+             range. *)
+          super#type_ t
+        else
+          (* In all other cases, selection is illegal. *)
+          t
     end
 
   let extract ast extract_range =
@@ -94,7 +338,7 @@ module AstExtractor = struct
 end
 
 module InformationCollectors = struct
-  class extracted_statements_information_collector =
+  class extracted_information_collector =
     object (this)
       inherit [Loc.t] Flow_ast_mapper.mapper as super
 
@@ -195,7 +439,7 @@ module InformationCollectors = struct
   }
 
   let collect_statements_information extracted_statements =
-    let information_collector = new extracted_statements_information_collector in
+    let information_collector = new extracted_information_collector in
     let () =
       List.iter
         (fun statement -> information_collector#statement statement |> ignore)
@@ -206,101 +450,15 @@ module InformationCollectors = struct
       async_function = information_collector#is_async;
       has_this_super = information_collector#has_this_super;
     }
-end
 
-module InsertionPointCollectors = struct
-  type function_insertion_point = {
-    function_name: string;
-    body_loc: Loc.t;
-    tparams_rev: Type.typeparam list;
-  }
-
-  type class_insertion_point = {
-    class_name: string option;
-    body_loc: Loc.t;
-    tparams_rev: Type.typeparam list;
-  }
-
-  let not_this_typeparam { Type.is_this; _ } = not is_this
-
-  class function_insertion_point_collector reader extracted_statements_loc =
-    object (this)
-      inherit Typed_ast_utils.type_parameter_mapper as super
-
-      val mutable acc = []
-
-      method private collect_name_and_loc ~tparams_rev function_name body_loc =
-        acc <-
-          (* Flow models `this` parameter as a generic parameter with bound, so it will appear in
-             the typeparam list. However, that is not necessary for the refactor purpose, since we
-             will never produce `this` annotations. *)
-          { function_name; body_loc; tparams_rev = List.filter not_this_typeparam tparams_rev }
-          :: acc
-
-      method function_inserting_locs_with_typeparams typed_ast =
-        let _ = this#program typed_ast in
-        acc
-
-      method! function_ function_declaration =
-        let open Flow_ast in
-        match function_declaration with
-        | {
-         Function.id = Some (_, { Identifier.name; _ });
-         body = Function.BodyBlock (block_aloc, _);
-         tparams;
-         _;
-        } ->
-          let block_loc = Parsing_heaps.Reader.loc_of_aloc ~reader block_aloc in
-          if Loc.contains block_loc extracted_statements_loc then
-            this#type_params_opt tparams (fun _ ->
-                this#collect_name_and_loc name block_loc |> this#annot_with_tparams);
-          super#function_ function_declaration
-        | _ -> super#function_ function_declaration
-    end
-
-  let collect_function_inserting_points ~typed_ast ~reader ~extracted_statements_loc =
-    let collector = new function_insertion_point_collector reader extracted_statements_loc in
-    collector#function_inserting_locs_with_typeparams typed_ast
-
-  class class_insertion_point_collector reader extracted_statements_loc =
-    object (this)
-      inherit Typed_ast_utils.type_parameter_mapper as super
-
-      val mutable acc = None
-
-      method private collect_name_and_loc ~tparams_rev class_name body_loc =
-        acc <-
-          Some { class_name; body_loc; tparams_rev = List.filter not_this_typeparam tparams_rev }
-
-      method closest_enclosing_class_scope typed_ast =
-        let _ = this#program typed_ast in
-        acc
-
-      method! class_ class_declaration =
-        let open Flow_ast in
-        let { Class.id; body = (body_aloc, _); tparams; _ } = class_declaration in
-        let body_loc = Parsing_heaps.Reader.loc_of_aloc ~reader body_aloc in
-        if Loc.contains extracted_statements_loc body_loc then
-          (* When the class is nested inside the extracted statements, we stop recursing down. *)
-          class_declaration
-        else if Loc.contains body_loc extracted_statements_loc then
-          let id =
-            match id with
-            | None -> None
-            | Some (_, { Identifier.name; _ }) -> Some name
-          in
-          let () =
-            this#type_params_opt tparams (fun _ ->
-                this#collect_name_and_loc id body_loc |> this#annot_with_tparams)
-          in
-          super#class_ class_declaration
-        else
-          super#class_ class_declaration
-    end
-
-  let find_closest_enclosing_class ~typed_ast ~reader ~extracted_statements_loc =
-    let collector = new class_insertion_point_collector reader extracted_statements_loc in
-    collector#closest_enclosing_class_scope typed_ast
+  let collect_expression_information extracted_expression =
+    let information_collector = new extracted_information_collector in
+    let _ = information_collector#expression extracted_expression in
+    {
+      has_unwrapped_control_flow = information_collector#has_unwrapped_control_flow;
+      async_function = information_collector#is_async;
+      has_this_super = information_collector#has_this_super;
+    }
 end
 
 module RefactorProgramMappers = struct
@@ -309,7 +467,7 @@ module RefactorProgramMappers = struct
       inherit [Loc.t] Flow_ast_mapper.mapper as super
 
       method! statement_fork_point stmt =
-        let (statement_loc, _) = stmt in
+        let statement_loc = Flow_ast_differ.expand_statement_comment_bounds stmt in
         if Loc.contains extracted_statements_loc statement_loc then
           if Loc.equal (Loc.start_loc extracted_statements_loc) (Loc.start_loc statement_loc) then
             function_call_statements
@@ -397,9 +555,116 @@ module RefactorProgramMappers = struct
     in
 
     mapper#program ast
+
+  class replace_original_expression_mapper ~expression_loc ~expression_replacement =
+    object (_this)
+      inherit [Loc.t] Flow_ast_mapper.mapper as super
+
+      method! expression ((expr_loc, _) as expr) =
+        if Loc.equal expr_loc expression_loc then
+          expression_replacement
+        else
+          super#expression expr
+    end
+
+  class extract_to_constant_refactor_mapper
+    ~statement_loc ~expression_loc ~expression_replacement ~constant_definition =
+    object (this)
+      inherit replace_original_expression_mapper ~expression_loc ~expression_replacement as super
+
+      method! statement_fork_point stmt =
+        let (stmt_loc, _) = stmt in
+        if Loc.equal stmt_loc statement_loc then
+          [constant_definition; this#statement stmt]
+        else
+          super#statement_fork_point stmt
+    end
+
+  let extract_to_constant
+      ~statement_loc ~expression_loc ~expression_replacement ~constant_definition ast =
+    let mapper =
+      new extract_to_constant_refactor_mapper
+        ~statement_loc
+        ~expression_loc
+        ~expression_replacement
+        ~constant_definition
+    in
+    mapper#program ast
+
+  class extract_to_class_field_refactor_mapper
+    ~class_body_loc ~expression_loc ~expression_replacement ~field_definition =
+    object (_this)
+      inherit replace_original_expression_mapper ~expression_loc ~expression_replacement as super
+
+      method! class_body block =
+        let open Flow_ast.Class.Body in
+        let (body_loc, body) = block in
+        if Loc.equal body_loc class_body_loc then
+          ( body_loc,
+            {
+              body with
+              body = field_definition :: Flow_ast_mapper.map_list super#class_element body.body;
+            } )
+        else
+          super#class_body block
+    end
+
+  let extract_to_class_field
+      ~class_body_loc ~expression_loc ~expression_replacement ~field_definition ast =
+    let mapper =
+      new extract_to_class_field_refactor_mapper
+        ~class_body_loc
+        ~expression_loc
+        ~expression_replacement
+        ~field_definition
+    in
+    mapper#program ast
+
+  class extract_to_type_alias_refactor_mapper ~statement_loc ~type_loc ~type_replacement ~type_alias
+    =
+    object (this)
+      inherit [Loc.t] Flow_ast_mapper.mapper as super
+
+      method! type_ ((loc, _) as t) =
+        if Loc.equal loc type_loc then
+          type_replacement
+        else
+          super#type_ t
+
+      method! statement_fork_point stmt =
+        let (stmt_loc, _) = stmt in
+        if Loc.equal stmt_loc statement_loc then
+          [type_alias; this#statement stmt]
+        else
+          super#statement_fork_point stmt
+    end
+
+  let extract_to_type_alias ~statement_loc ~type_loc ~type_replacement ~type_alias ast =
+    let mapper =
+      new extract_to_type_alias_refactor_mapper
+        ~statement_loc
+        ~type_loc
+        ~type_replacement
+        ~type_alias
+    in
+    mapper#program ast
 end
 
 module VariableAnalysis = struct
+  class identifier_collector =
+    object (_this)
+      inherit [SSet.t, Loc.t] Flow_ast_visitor.visitor ~init:SSet.empty as super
+
+      method! identifier id =
+        let (_, { Flow_ast.Identifier.name; _ }) = id in
+        let () = acc |> SSet.add name |> super#set_acc in
+        id
+    end
+
+  let collect_used_names ast =
+    let collector = new identifier_collector in
+    collector#eval collector#program ast
+
   type relevant_defs = {
     defs_with_scopes_of_local_uses: (Scope_api.Def.t * Scope_api.Scope.t) list;
     vars_with_shadowed_local_reassignments: (string * Loc.t) list;
@@ -582,7 +847,7 @@ module TypeSynthesizer = struct
 
   class type_collector reader (locs : LocSet.t) =
     object (this)
-      inherit Typed_ast_utils.type_parameter_mapper
+      inherit Typed_ast_utils.type_parameter_mapper as super
 
       val mutable acc = LocMap.empty
 
@@ -599,6 +864,11 @@ module TypeSynthesizer = struct
         let loc = Parsing_heaps.Reader.loc_of_aloc ~reader aloc in
         if LocSet.mem loc locs then this#annot_with_tparams (this#collect_type_at_loc loc t);
         ident
+
+      method! type_ (((aloc, type_), _) as ast_type) =
+        let loc = Parsing_heaps.Reader.loc_of_aloc ~reader aloc in
+        if LocSet.mem loc locs then this#annot_with_tparams (this#collect_type_at_loc loc type_);
+        super#type_ ast_type
     end
 
   class generic_name_collector =
@@ -689,7 +959,7 @@ module TypeSynthesizer = struct
         | None -> None
         | Some default -> Some (default |> type_scheme_of_type |> synth_type Loc.none |> snd)
       in
-      Ast_builder.Types.type_param ~bound ~variance ~default name
+      Ast_builder.Types.type_param ~bound ?variance ?default name
     in
     let type_synthesizer loc =
       match LocMap.find_opt loc type_at_loc_map with

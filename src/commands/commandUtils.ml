@@ -703,7 +703,6 @@ let flowconfig_flags prev =
 
 type connect_params = {
   retries: int;
-  retry_if_init: bool;
   timeout: int option;
   no_auto_start: bool;
   autostop: bool;
@@ -716,17 +715,8 @@ type connect_params = {
 }
 
 let collect_connect_flags
-    main
-    lazy_mode
-    timeout
-    retries
-    retry_if_init
-    no_auto_start
-    temp_dir
-    shm_flags
-    ignore_version
-    quiet
-    on_mismatch =
+    main lazy_mode timeout retries no_auto_start temp_dir shm_flags ignore_version quiet on_mismatch
+    =
   let default def = function
     | Some x -> x
     | None -> def
@@ -739,7 +729,6 @@ let collect_connect_flags
   main
     {
       retries = default 3 retries;
-      retry_if_init = default true retry_if_init;
       timeout;
       no_auto_start;
       temp_dir;
@@ -758,10 +747,6 @@ let connect_flags_with_lazy_collector collector =
     collector
     |> flag "--timeout" (optional int) ~doc:"Maximum time to wait, in seconds"
     |> flag "--retries" (optional int) ~doc:"Set the number of retries. (default: 3)"
-    |> flag
-         "--retry-if-init"
-         (optional bool)
-         ~doc:"retry if the server is initializing (default: true)"
     |> flag "--no-auto-start" no_arg ~doc:"If the server is not running, do not start it; just exit"
     |> temp_dir_flag
     |> shm_flags
@@ -811,6 +796,7 @@ module Options_flags = struct
     temp_dir: string option;
     traces: int option;
     trust_mode: Options.trust_mode option;
+    new_env: bool;
     abstract_locations: bool;
     verbose: Verbose.t option;
     wait_for_recheck: bool option;
@@ -869,7 +855,8 @@ let options_flags =
       merge_timeout
       abstract_locations
       include_suppressions
-      trust_mode =
+      trust_mode
+      new_env =
     (match merge_timeout with
     | Some timeout when timeout < 0 ->
       Exit.(exit ~msg:"--merge-timeout must be non-negative" Commandline_usage_error)
@@ -881,6 +868,7 @@ let options_flags =
         profile;
         all;
         wait_for_recheck;
+        new_env;
         weak;
         traces;
         no_flowlib;
@@ -957,7 +945,8 @@ let options_flags =
                    ("silent", Options.SilentTrust);
                    ("none", Options.NoTrust);
                  ]))
-           ~doc:"")
+           ~doc:""
+      |> flag "--new-env" no_arg ~doc:"")
 
 let saved_state_flags =
   let collect_saved_state_flags
@@ -1245,6 +1234,7 @@ let make_options
     opt_enforce_strict_call_arity = FlowConfig.enforce_strict_call_arity flowconfig;
     opt_enums = FlowConfig.enums flowconfig;
     opt_enums_with_unknown_members = FlowConfig.enums_with_unknown_members flowconfig;
+    opt_new_env = options_flags.new_env || FlowConfig.new_env flowconfig;
     opt_exact_by_default = FlowConfig.exact_by_default flowconfig;
     opt_facebook_fbs = FlowConfig.facebook_fbs flowconfig;
     opt_facebook_fbt = FlowConfig.facebook_fbt flowconfig;
@@ -1284,7 +1274,7 @@ let make_options
     opt_react_runtime = FlowConfig.react_runtime flowconfig;
     opt_react_server_component_exts = FlowConfig.react_server_component_exts flowconfig;
     opt_recursion_limit = FlowConfig.recursion_limit flowconfig;
-    opt_refactor = flowconfig |> FlowConfig.refactor |> Option.value ~default:false;
+    opt_refactor = flowconfig |> FlowConfig.refactor |> Option.value ~default:true;
     opt_max_files_checked_per_worker = FlowConfig.max_files_checked_per_worker flowconfig;
     opt_max_rss_bytes_for_check_per_worker =
       FlowConfig.max_rss_bytes_for_check_per_worker flowconfig;
@@ -1599,7 +1589,7 @@ let rec connect_and_make_request flowconfig_name =
           SocketHandshake.client_build_id = SocketHandshake.build_revision;
           client_version = Flow_version.version;
           is_stop_request = false;
-          server_should_hangup_if_still_initializing = not connect_flags.retry_if_init;
+          server_should_hangup_if_still_initializing = false;
           version_mismatch_strategy;
         },
         { SocketHandshake.client_type = SocketHandshake.Ephemeral } )
@@ -1702,7 +1692,7 @@ let choose_file_watcher
       | None -> default_file_watcher_mergebase_with
     in
     let survive_restarts =
-      Base.Option.value ~default:false (FlowConfig.watchman_survive_restarts flowconfig)
+      Base.Option.value ~default:true (FlowConfig.watchman_survive_restarts flowconfig)
     in
     FlowServerMonitorOptions.Watchman
       {

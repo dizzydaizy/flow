@@ -8,10 +8,17 @@
 open OUnit2
 open Refactor_extract_utils_tests
 
-let assert_refactored ~ctxt expected source extract_range =
+let assert_refactored
+    ~ctxt ?(support_experimental_snippet_text_edit = false) expected source extract_range =
   let ast = parse source in
   let typed_ast = typed_ast_of_ast ast in
   let reader = State_reader.create () in
+  let remove_blank_lines s =
+    s
+    |> String.split_on_char '\n'
+    |> List.filter (fun s -> String.trim s <> "")
+    |> String.concat "\n"
+  in
   let actual =
     Refactor_extract.provide_available_refactors
       ~ast
@@ -20,6 +27,7 @@ let assert_refactored ~ctxt expected source extract_range =
       ~file_sig:(file_sig_of_ast ast)
       ~typed_ast
       ~reader
+      ~support_experimental_snippet_text_edit
       ~extract_range
     |> List.map (fun { Refactor_extract.title; new_ast; _ } ->
            ( title,
@@ -29,10 +37,11 @@ let assert_refactored ~ctxt expected source extract_range =
                   ~preserve_docblock:true
                   ~checksum:None
              |> pretty_print
-             |> String.trim ))
+             |> String.trim
+             |> remove_blank_lines ))
   in
   let expected : (string * string) list =
-    List.map (fun (title, s) -> (title, String.trim s)) expected
+    List.map (fun (title, s) -> (title, s |> String.trim |> remove_blank_lines)) expected
   in
   let printer refactors =
     refactors
@@ -315,7 +324,21 @@ async function newFunction(): Promise<void> {
   await b;
   let d = 6;
 }
-      |}
+            |}
+          );
+          ( "Extract to inner function in function 'test'",
+            {|
+const test = (async () => {
+  await newFunction();
+  async function newFunction(): Promise<void> {
+    // selection start
+    const a = 3;
+    let b = 4;
+    await b;
+    let d = 6;
+  }
+});
+            |}
           );
         ]
       in
@@ -346,7 +369,22 @@ async function newFunction(): Promise<void> {
   }
   let d = 6;
 }
-      |}
+            |}
+          );
+          ( "Extract to inner function in function 'test'",
+            {|
+const test = (async () => {
+  await newFunction();
+  async function newFunction(): Promise<void> {
+    // selection start
+    const a = 3;
+    {
+      for await (const b of []) {}
+    }
+    let d = 6;
+  }
+});
+            |}
           );
         ]
       in
@@ -529,6 +567,18 @@ function newFunction(): void {
   console.log();
 }
           |}
+          );
+          ( "Extract to inner function in method 'test1'",
+            {|
+class A {
+  test1() {
+    newFunction();
+    function newFunction(): void {
+      console.log();
+    }
+  }
+}
+            |}
           );
         ]
         "class A { test1() { console.log(); } }"
@@ -963,6 +1013,285 @@ function level1() {
         ]
       in
       assert_refactored ~ctxt expected source (mk_loc (13, 18) (15, 61)) );
+    (* A simple constant extraction that can go to all possible scopes. *)
+    ( "simple_constant_extract" >:: fun ctxt ->
+      let source = "function test() { const a = 1; }" in
+      let expected =
+        [
+          ( "Extract to constant in function 'test'",
+            {|
+function test() {
+  const newLocal = 1;
+  const a = newLocal;
+}
+            |} );
+          ( "Extract to constant in module scope",
+            {|
+const newLocal = 1;
+function test() {
+  const a = newLocal;
+}
+            |} );
+        ]
+      in
+      assert_refactored ~ctxt expected source (mk_loc (1, 28) (1, 29)) );
+    (* Testing that we won't extract constant to scopes that will result in undefined variables. *)
+    ( "constant_extract_with_scoping_issues" >:: fun ctxt ->
+      let source =
+        {|
+        function foo() {
+          const a = 3;
+          function bar() {
+            const b = 4;
+            function baz() {
+              const c = 5;
+              // selected a + b + c
+              return a + b + c;
+            }
+          }
+        }
+        |}
+      in
+      let expected =
+        [
+          ( "Extract to constant in function 'baz'",
+            {|
+function foo() {
+  const a = 3;
+  function bar() {
+    const b = 4;
+    function baz() {
+      const c = 5;
+      const newLocal = a + b + c;
+      // selected a + b + c
+      return newLocal;
+    }
+  }
+}
+          |}
+          );
+        ]
+      in
+      assert_refactored ~ctxt expected source (mk_loc (9, 21) (9, 30)) );
+    (* A simple field extraction that can only go inside the class. *)
+    ( "field_extract_class_only" >:: fun ctxt ->
+      let source = "class A { test() { const a = this.test(); } }" in
+      let expected =
+        [
+          ( "Extract to field in class 'A'",
+            {|
+class A {
+  newProperty = this.test();
+  test() {
+    const a = this.newProperty;
+  }
+}
+            |}
+          );
+          ( "Extract to constant in method 'test'",
+            {|
+class A {
+  test() {
+    const newLocal = this.test();
+    const a = newLocal;
+  }
+}
+            |}
+          );
+        ]
+      in
+      assert_refactored ~ctxt expected source (mk_loc (1, 29) (1, 40)) );
+    (* A simple type alias extraction without any type variables. *)
+    ( "simple_type_extract" >:: fun ctxt ->
+      let source = "const a: number = 1;" in
+      let expected = [("Extract to type alias", "type NewType = number;\nconst a: NewType = 1;")] in
+      assert_refactored ~ctxt expected source (mk_loc (1, 9) (1, 15)) );
+    (* Selected type uses generic type parameters *)
+    ( "type_extract_with_generic_type_parameters" >:: fun ctxt ->
+      let source =
+        {|
+        function foo<A, B>() {
+          class Bar<C, D> {
+            baz<E, F>(): [A, B, C, D, E, F] { }
+          }
+        }
+        |}
+      in
+      let expected =
+        [
+          ( "Extract to type alias",
+            {|
+function foo<A, B>() {
+  type NewType<C, D, E, F> = [A, B, C, D, E, F];
+  class Bar<C, D> {
+    baz<E, F>(): NewType<C, D, E, F> {}
+  }
+}
+            |}
+          );
+        ]
+      in
+      assert_refactored ~ctxt expected source (mk_loc (4, 25) (4, 43)) );
+    (* Generated name has conflicts. *)
+    ( "generated_name_conflicts" >:: fun ctxt ->
+      let source =
+        {|
+        const newFunction = 1, newFunction1 = 1;
+        const newMethod = 1, newMethod1 = 1;
+        const newLocal = 1, newLocal1 = 1;
+        const newProperty = 1, newProperty1 = 1;
+        class A {
+          test() {
+            1 + 1
+          }
+        }
+        |}
+      in
+      let expected =
+        [
+          ( "Extract to method in class 'A'",
+            {|
+const newFunction = 1,
+  newFunction1 = 1;
+const newMethod = 1,
+  newMethod1 = 1;
+const newLocal = 1,
+  newLocal1 = 1;
+const newProperty = 1,
+  newProperty1 = 1;
+class A {
+  test() {
+    this.${0:newMethod2}();
+  }
+  ${0:newMethod2}(): void {
+    1 + 1;
+  }
+}
+            |}
+          );
+          ( "Extract to function in module scope",
+            {|
+const newFunction = 1,
+  newFunction1 = 1;
+const newMethod = 1,
+  newMethod1 = 1;
+const newLocal = 1,
+  newLocal1 = 1;
+const newProperty = 1,
+  newProperty1 = 1;
+class A {
+  test() {
+    ${0:newFunction2}();
+  }
+}
+function ${0:newFunction2}(): void {
+  1 + 1;
+}
+            |}
+          );
+          ( "Extract to inner function in method 'test'",
+            {|
+const newFunction = 1,
+  newFunction1 = 1;
+const newMethod = 1,
+  newMethod1 = 1;
+const newLocal = 1,
+  newLocal1 = 1;
+const newProperty = 1,
+  newProperty1 = 1;
+class A {
+  test() {
+    ${0:newFunction2}();
+    function ${0:newFunction2}(): void {
+      1 + 1;
+    }
+  }
+}
+            |}
+          );
+          ( "Extract to field in class 'A'",
+            {|
+const newFunction = 1,
+  newFunction1 = 1;
+const newMethod = 1,
+  newMethod1 = 1;
+const newLocal = 1,
+  newLocal1 = 1;
+const newProperty = 1,
+  newProperty1 = 1;
+class A {
+  ${0:newProperty2} = 1 + 1;
+  test() {
+    this.${0:newProperty2};
+  }
+}
+            |}
+          );
+          ( "Extract to constant in method 'test'",
+            {|
+const newFunction = 1,
+  newFunction1 = 1;
+const newMethod = 1,
+  newMethod1 = 1;
+const newLocal = 1,
+  newLocal1 = 1;
+const newProperty = 1,
+  newProperty1 = 1;
+class A {
+  test() {
+    const ${0:newLocal2} = 1 + 1;
+    ${0:newLocal2};
+  }
+}
+            |}
+          );
+          ( "Extract to constant in module scope",
+            {|
+const newFunction = 1,
+  newFunction1 = 1;
+const newMethod = 1,
+  newMethod1 = 1;
+const newLocal = 1,
+  newLocal1 = 1;
+const newProperty = 1,
+  newProperty1 = 1;
+const ${0:newLocal2} = 1 + 1;
+class A {
+  test() {
+    ${0:newLocal2};
+  }
+}
+            |}
+          );
+        ]
+      in
+      assert_refactored
+        ~ctxt
+        ~support_experimental_snippet_text_edit:true
+        expected
+        source
+        (mk_loc (8, 12) (8, 17));
+      let source = {|
+        type NewType = number;
+        type NewType1 = NewType;
+      |} in
+      let expected =
+        [
+          ( "Extract to type alias",
+            {|
+type ${0:NewType2} = number;
+type NewType = ${0:NewType2};
+type NewType1 = NewType;
+            |}
+          );
+        ]
+      in
+      assert_refactored
+        ~ctxt
+        ~support_experimental_snippet_text_edit:true
+        expected
+        source
+        (mk_loc (2, 23) (2, 29)) );
   ]
 
 let tests =

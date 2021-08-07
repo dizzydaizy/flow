@@ -18,38 +18,10 @@ type bindings =
   | NamedType of named_binding list
   | Namespace of string
 
-type change =
+type placement =
   | Above of { skip_line: bool }
   | Below of { skip_line: bool }
   | Replace
-
-module ImportKind = struct
-  type t =
-    | ImportType
-    | ImportValue
-    | Require
-
-  let compare a b =
-    match (a, b) with
-    | (ImportType, ImportType) -> 0
-    | (ImportValue, ImportValue) -> 0
-    | (Require, Require) -> 0
-    | (ImportType, _) -> (* types come first *) -1
-    | (_, ImportType) -> (* types come first *) 1
-    | (_, Require) -> (* requires come last *) -1
-    | (Require, _) -> (* requires come last *) 1
-
-  let of_statement = function
-    | (_, Statement.ImportDeclaration { Statement.ImportDeclaration.import_kind; _ }) ->
-      (match import_kind with
-      | Statement.ImportDeclaration.ImportType
-      | Statement.ImportDeclaration.ImportTypeof ->
-        ImportType
-      | Statement.ImportDeclaration.ImportValue -> ImportValue)
-    | _ ->
-      (* TODO: handle requires *)
-      Require
-end
 
 module ImportSource = struct
   let compare a b =
@@ -64,6 +36,52 @@ module ImportSource = struct
     | _ ->
       (* TODO: handle requires *)
       failwith "only imports are handled so far"
+
+  let is_lower source =
+    String.length source > 1
+    &&
+    match source.[0] with
+    | 'a' .. 'z' -> true
+    | _ -> false
+end
+
+module Section = struct
+  type t =
+    | ImportType
+    | ImportValueFromRelative  (** import ... from './foo' *)
+    | ImportValueFromModule  (** import ... from 'foo' *)
+    | Require
+
+  let compare a b =
+    match (a, b) with
+    | (ImportType, ImportType) -> 0
+    | (ImportValueFromRelative, ImportValueFromRelative) -> 0
+    | (ImportValueFromModule, ImportValueFromModule) -> 0
+    | (Require, Require) -> 0
+    | (ImportType, _) -> (* types come first *) -1
+    | (_, ImportType) -> (* types come first *) 1
+    | (ImportValueFromRelative, ImportValueFromModule) -> -1
+    | (ImportValueFromModule, ImportValueFromRelative) -> 1
+    | (_, Require) -> (* requires come last *) -1
+    | (Require, _) -> (* requires come last *) 1
+
+  let of_statement = function
+    | ( _,
+        Statement.ImportDeclaration
+          { Statement.ImportDeclaration.import_kind; source = (_, { StringLiteral.value; _ }); _ }
+      ) ->
+      (match import_kind with
+      | Statement.ImportDeclaration.ImportType
+      | Statement.ImportDeclaration.ImportTypeof ->
+        ImportType
+      | Statement.ImportDeclaration.ImportValue ->
+        if ImportSource.is_lower value then
+          ImportValueFromModule
+        else
+          ImportValueFromRelative)
+    | _ ->
+      (* TODO: handle requires *)
+      Require
 end
 
 let mk_default_import ?loc ?comments ~from name =
@@ -177,10 +195,7 @@ let compare_specifiers a b =
   let { remote = (_, { Identifier.name = b_name; comments = _ }); _ } = b in
   String.compare a_name b_name
 
-let insert_import ~options ~bindings ~from =
-  string_of_statement ~options (mk_import ~bindings ~from)
-
-let update_import ~options ~bindings stmt =
+let update_import ~bindings stmt =
   let open Statement in
   let open Statement.ImportDeclaration in
   let loc =
@@ -189,6 +204,7 @@ let update_import ~options ~bindings stmt =
   in
   match stmt with
   | (_, ImportDeclaration { import_kind; source; default; specifiers; comments }) ->
+    let (_, { StringLiteral.value = from; _ }) = source in
     let edit =
       match (bindings, default, specifiers) with
       | (Default bound_name, Some (_, { Identifier.name; _ }), _)
@@ -197,30 +213,22 @@ let update_import ~options ~bindings stmt =
           Some (ImportNamespaceSpecifier (_, (_, { Identifier.name; _ }))) ) ->
         if bound_name = name then
           (* this should never happen, the name is already in scope *)
-          (Above { skip_line = false }, "")
+          (Replace, stmt)
         else
           (* an `import Baz from 'foo'` already exists. weird, but insert
              an `import Foo from 'foo'` anyway. (and similar for `import * as Baz ...`) *)
-          let new_stmt =
-            let (_, { StringLiteral.value = from; _ }) = source in
-            insert_import ~options ~bindings ~from
-          in
-          let change =
+          let placement =
             if String.compare bound_name name < 0 then
               Above { skip_line = false }
             else
               Below { skip_line = false }
           in
-          (change, new_stmt)
+          (placement, mk_import ~bindings ~from)
       | (Default _, None, Some _) ->
         (* a `import {bar} from 'foo'` or `import * as Foo from 'foo'` already exists.
            rather than change it to `import Foo, {bar} from 'foo'`, we choose to insert
            a separate import. TODO: maybe make this a config option? *)
-        let new_stmt =
-          let (_, { StringLiteral.value = from; _ }) = source in
-          insert_import ~options ~bindings ~from
-        in
-        (Above { skip_line = false }, new_stmt)
+        (Above { skip_line = false }, mk_import ~bindings ~from)
       | (Named bound_names, _, Some (ImportNamedSpecifiers specifiers))
       | (NamedType bound_names, _, Some (ImportNamedSpecifiers specifiers)) ->
         let open ImportDeclaration in
@@ -253,42 +261,94 @@ let update_import ~options ~bindings stmt =
         let stmt =
           (loc, ImportDeclaration { import_kind; source; default; specifiers; comments })
         in
-        let edit = string_of_statement ~options stmt in
-        (Replace, edit)
+        (Replace, stmt)
       | (Named _, Some _, _)
       | (Named _, None, Some (ImportNamespaceSpecifier _))
       | (NamedType _, Some _, _)
-      | (NamedType _, None, Some (ImportNamespaceSpecifier _))
-      | (Namespace _, Some _, _)
-      | (Namespace _, None, Some (ImportNamedSpecifiers _)) ->
+      | (NamedType _, None, Some (ImportNamespaceSpecifier _)) ->
         (* trying to insert a named specifier, but a default or namespace import already
            exists. rather than change it to `import Foo, {bar} from 'foo'`, we choose to
-           insert a separate import `import {bar} from 'foo'`.
+           insert a separate import `import {bar} from 'foo'` below the namespace/default
+           import. TODO: maybe make this a config option? *)
+        (Below { skip_line = false }, mk_import ~bindings ~from)
+      | (Namespace _, Some _, _) ->
+        (* trying to insert a namespace specifier, but a default import already exists.
+           rather than change it to `import * as Foo, Bar from 'foo'`, we choose to
+           insert a separate import `import * as Foo from 'foo'` below the default.
            TODO: maybe make this a config option? *)
-        let new_stmt =
-          let (_, { StringLiteral.value = from; _ }) = source in
-          insert_import ~options ~bindings ~from
-        in
-        (Below { skip_line = false }, new_stmt)
+        (Below { skip_line = false }, mk_import ~bindings ~from)
+      | (Namespace _, None, Some (ImportNamedSpecifiers _)) ->
+        (* trying to insert a namespace specifier, but a named import already exists.
+           rather than change it to `import * as Foo, {bar} from 'foo'`, we choose to
+           insert a separate import `import * as Foo from 'foo'` above the named import.
+           TODO: maybe make this a config option? *)
+        (Above { skip_line = false }, mk_import ~bindings ~from)
       | (_, None, None) -> failwith "unexpected import with neither a default nor specifiers"
     in
     (loc, edit)
   | _ -> failwith "trying to update a non-import"
 
+(** default < namespace < named *)
+let compare_kind_of_import a b =
+  let open Statement in
+  let open Statement.ImportDeclaration in
+  let compare_identifier (_, { Identifier.name = a; _ }) (_, { Identifier.name = b; _ }) =
+    String.compare a b
+  in
+  match (a, b) with
+  | ( ( _,
+        ImportDeclaration
+          {
+            import_kind = _;
+            source = _;
+            default = a_default;
+            specifiers = a_specifiers;
+            comments = _;
+          } ),
+      ( _,
+        ImportDeclaration
+          {
+            import_kind = _;
+            source = _;
+            default = b_default;
+            specifiers = b_specifiers;
+            comments = _;
+          } ) ) ->
+    (match (a_default, b_default) with
+    | (Some a_id, Some b_id) -> compare_identifier a_id b_id
+    | (Some _, None) -> -1
+    | (None, Some _) -> 1
+    | (None, None) ->
+      (match (a_specifiers, b_specifiers) with
+      | (Some (ImportNamespaceSpecifier (_, a_id)), Some (ImportNamespaceSpecifier (_, b_id))) ->
+        compare_identifier a_id b_id
+      | (Some (ImportNamespaceSpecifier _), Some (ImportNamedSpecifiers _)) -> -1
+      | (Some (ImportNamespaceSpecifier _), None) -> -1
+      | (Some (ImportNamedSpecifiers _), Some (ImportNamedSpecifiers _)) -> 0
+      | (Some (ImportNamedSpecifiers _), Some (ImportNamespaceSpecifier _)) -> 1
+      | (Some (ImportNamedSpecifiers _), None) -> -1
+      | (None, None) -> 0
+      | (None, Some _) -> -1))
+  | _ -> 0
+
 let compare_imports a b =
-  let k = ImportKind.(compare (of_statement a) (of_statement b)) in
+  let k = Section.(compare (of_statement a) (of_statement b)) in
   if k = 0 then
-    ImportSource.(compare (of_statement a) (of_statement b))
+    let k = ImportSource.(compare (of_statement a) (of_statement b)) in
+    if k = 0 then
+      compare_kind_of_import a b
+    else
+      k
   else
     k
 
 (** [sorted_insertion_point import imports] walks [imports], ensuring it is
   sorted, and looking for the correct place to insert [import]. returns [None]
-  if [imports] is not sorted, or [Some (loc, change)] where [change] is whether
-  to insert above or below. *)
+  if [imports] is not sorted, or [Some (loc, placement)] where [placement] is
+  whether to insert above or below. *)
 let sorted_insertion_point =
-  let potential_change import current =
-    let k = ImportKind.(compare (of_statement import) (of_statement current)) in
+  let relative_placement import current =
+    let k = Section.(compare (of_statement import) (of_statement current)) in
     if k = 0 then
       (* same section *)
       let k = ImportSource.(compare (of_statement import) (of_statement current)) in
@@ -321,7 +381,7 @@ let sorted_insertion_point =
           match acc with
           | None
           | Some (_, Below _) ->
-            Some (fst current, potential_change import current)
+            Some (fst current, relative_placement import current)
           | Some (_, Above _)
           | Some (_, Replace) ->
             acc
@@ -352,23 +412,23 @@ let insertion_point ~imports ~body import =
       (* above first body statement *)
       (loc, Above { skip_line = true }))
 
-let kind_matches_bindings bindings import_kind =
-  let open ImportKind in
+let section_matches_bindings bindings section =
+  let open Section in
   (* TODO: confirm CJS/ESM interop, depends on flowconfig *)
-  match (import_kind, bindings) with
+  match (section, bindings) with
   | (ImportType, NamedType _) -> true
   | (ImportType, (Default _ | Named _ | Namespace _)) -> false
   | (Require, Default _) -> true
   | (Require, (Named _ | NamedType _ | Namespace _)) -> false
-  | (ImportValue, NamedType _) -> false
-  | (ImportValue, (Default _ | Named _ | Namespace _)) -> true
+  | ((ImportValueFromRelative | ImportValueFromModule), NamedType _) -> false
+  | ((ImportValueFromRelative | ImportValueFromModule), (Default _ | Named _ | Namespace _)) -> true
 
 let existing_import ~bindings ~from imports =
   let open Statement in
   let potentials =
     Base.List.filter
       ~f:(fun stmt ->
-        kind_matches_bindings bindings (ImportKind.of_statement stmt)
+        section_matches_bindings bindings (Section.of_statement stmt)
         && ImportSource.of_statement stmt = from)
       imports
   in
@@ -391,54 +451,141 @@ let existing_import ~bindings ~from imports =
   in
   closest potentials
 
-let add_single_import ~options ~bindings ~from ~imports ~body : Loc.t * string =
-  let (loc, edit) =
+let get_change ~imports ~body (from, bindings) =
+  let (loc, placement, stmt) =
     match existing_import ~bindings ~from imports with
-    | Some stmt -> update_import ~options ~bindings stmt
+    | Some stmt ->
+      let (loc, (placement, stmt)) = update_import ~bindings stmt in
+      (loc, placement, stmt)
     | None ->
       let new_import = mk_import ~bindings ~from in
-      let (loc, change) = insertion_point ~imports ~body new_import in
-      (loc, (change, string_of_statement ~options new_import))
+      let (loc, placement) = insertion_point ~imports ~body new_import in
+      (loc, placement, new_import)
   in
+  let loc =
+    match placement with
+    | Above _ -> Loc.start_loc loc
+    | Below _ -> Loc.end_loc loc
+    | Replace -> loc
+  in
+  (loc, (placement, stmt))
+
+let string_of_change ~options (loc, (placement, stmt)) =
+  let str = string_of_statement ~options stmt in
   let edit =
-    match edit with
-    | (Above { skip_line }, str) ->
+    match placement with
+    | Above { skip_line } ->
       (* str doesn't include a newline, so we add one. if we want to skip
          a line, we add 2. *)
-      let loc = Loc.start_loc loc in
       if skip_line then
-        (loc, str ^ "\n\n")
+        str ^ "\n\n"
       else
-        (loc, str ^ "\n")
-    | (Below { skip_line }, str) ->
+        str ^ "\n"
+    | Below { skip_line } ->
       (* loc of the previous statement doesn't include the trailing \n,
          so we add one to the beginning to replace it, and the existing
          one ends up trailing our inserted statement. if we want to skip
          a line, we add 2. *)
-      let loc = Loc.end_loc loc in
       if skip_line then
-        (loc, "\n\n" ^ str)
+        "\n\n" ^ str
       else
-        (loc, "\n" ^ str)
-    | (Replace, str) -> (loc, str)
+        "\n" ^ str
+    | Replace -> str
   in
-  edit
+  (loc, edit)
+
+(** Ordering of placements, assuming they refer to the same Loc:
+      1. Above { skip_line = true }
+      2. Above { skip_line = false }
+      3. Replace
+      4. Below { skip_line = false }
+      5. Below { skip_line = true }
+  *)
+let compare_placement p1 p2 =
+  match (p1, p2) with
+  | (Above { skip_line = s1 }, Above { skip_line = s2 }) -> Base.Bool.compare s2 s1
+  | (Above _, (Below _ | Replace)) -> -1
+  | (Below { skip_line = s1 }, Below { skip_line = s2 }) -> Base.Bool.compare s1 s2
+  | (Below _, (Above _ | Replace)) -> 1
+  | (Replace, Replace) -> 0
+  | (Replace, Above _) -> 1
+  | (Replace, Below _) -> -1
+
+(** Orders changes based on where they'll appear in the updated file.
+
+    For example, [(Above { skip_line = true }, import_bar)] is sorted before
+    [(Above { skip_line = true }, import_foo)]. Both are sorted before
+    [(Above { skip_line = false }, import_baz)] because they will end up
+    with a blank line between them and [import_baz]. *)
+let compare_changes (loc1, (placement1, stmt1)) (loc2, (placement2, stmt2)) =
+  let k = Loc.compare loc1 loc2 in
+  if k = 0 then
+    let k = compare_placement placement1 placement2 in
+    if k = 0 then
+      compare_imports stmt1 stmt2
+    else
+      k
+  else
+    k
+
+(** Given a list of changes, eliminates whitespace between imports in the same group.
+
+    For example, consider these imports, inserted into a file with no existing imports:
+
+      [import type {foo} from './foo']
+      [import {bar} from './bar']
+      [import {baz} from './baz']
+
+    All 3 have [Above { skip_line = true }] because they're inserted at the top
+    of the file, with a blank line between the first real code. But we don't want to
+    render a line between [bar] and [baz] because they're both named imports, so we
+    need to change [skip_line] to [false] for [bar]. But [foo] is a different group,
+    so it should still skip a line; [baz] is the last one so it should still skip a
+    line to separate the whole group from what follows. *)
+let adjust_placements =
+  let rec loop prev acc = function
+    | [] -> Base.List.rev (prev :: acc)
+    | next :: rest ->
+      let (prev_loc, (prev_placement, prev_stmt)) = prev in
+      let (next_loc, (next_placement, next_stmt)) = next in
+      let (prev, next) =
+        if
+          Loc.equal prev_loc next_loc
+          && compare_placement prev_placement next_placement = 0
+          && Section.(compare (of_statement prev_stmt) (of_statement next_stmt)) = 0
+        then
+          (* being inserted into the same section, so eliminate the line between them *)
+          let (prev_placement, next_placement) =
+            match prev_placement with
+            | Above _ -> (Above { skip_line = false }, next_placement)
+            | Below _ -> (prev_placement, Below { skip_line = false })
+            | Replace -> (prev_placement, next_placement)
+          in
+          let prev = (prev_loc, (prev_placement, prev_stmt)) in
+          let next = (next_loc, (next_placement, next_stmt)) in
+          (prev, next)
+        else
+          (prev, next)
+      in
+      loop next (prev :: acc) rest
+  in
+  function
+  | [] -> []
+  | hd :: tl -> loop hd [] tl
+
+let add_imports ~options ~added_imports ast : (Loc.t * string) list =
+  let (Flow_ast_differ.Partitioned { directives = _; imports; body }) =
+    let (_, { Program.statements; _ }) = ast in
+    Flow_ast_differ.partition_imports statements
+  in
+  added_imports
+  |> Base.List.map ~f:(get_change ~imports ~body)
+  |> Base.List.sort ~compare:compare_changes
+  |> adjust_placements
+  |> Base.List.map ~f:(string_of_change ~options)
 
 let add_import ~options ~bindings ~from ast : (Loc.t * string) list =
-  let (Flow_ast_differ.Partitioned { directives = _; imports; body }) =
-    let (_, { Program.statements; _ }) = ast in
-    Flow_ast_differ.partition_imports statements
-  in
-  [add_single_import ~options ~bindings ~from ~imports ~body]
-
-let add_imports ~options ~added_imports ast =
-  let (Flow_ast_differ.Partitioned { directives = _; imports; body }) =
-    let (_, { Program.statements; _ }) = ast in
-    Flow_ast_differ.partition_imports statements
-  in
-  List.map
-    (fun (from, bindings) -> add_single_import ~options ~from ~bindings ~imports ~body)
-    added_imports
+  add_imports ~options ~added_imports:[(from, bindings)] ast
 
 module Identifier_finder = struct
   type kind =

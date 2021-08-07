@@ -464,6 +464,32 @@ let parse_executeCommand (params : json option) : ExecuteCommand.params =
 
 let print_executeCommand (() : ExecuteCommand.result) : json = JSON_Null
 
+(** workspace/applyEdit server -> client request *)
+module ApplyWorkspaceEditFmt = struct
+  open ApplyWorkspaceEdit
+
+  let json_of_params (params : params) : json =
+    let { label; edit } = params in
+    Jprint.object_opt
+      [("label", Base.Option.map ~f:string_ label); ("edit", Some (print_workspaceEdit edit))]
+
+  let result_of_json (json : json option) : result =
+    {
+      applied = Jget.bool_exn json "applied";
+      failureReason = Jget.string_opt json "failureReason";
+      failedChange = Jget.int_opt json "failedChange";
+    }
+
+  let json_of_result (result : result) : json =
+    let { applied; failureReason; failedChange } = result in
+    Jprint.object_opt
+      [
+        ("applied", Some (JSON_Bool applied));
+        ("failureReason", Base.Option.map ~f:string_ failureReason);
+        ("failedChange", Base.Option.map ~f:int_ failedChange);
+      ]
+end
+
 (************************************************************************)
 (* textDocument/publishDiagnostics notification                         *)
 (************************************************************************)
@@ -1109,6 +1135,7 @@ let parse_initialize (params : json option) : Initialize.params =
         textDocument = Jget.obj_opt json "textDocument" |> parse_textDocument;
         window = Jget.obj_opt json "window" |> parse_window;
         telemetry = Jget.obj_opt json "telemetry" |> parse_telemetry;
+        experimental = Jget.obj_opt json "experimental" |> parse_experimental;
       }
     and parse_workspace json =
       {
@@ -1151,6 +1178,8 @@ let parse_initialize (params : json option) : Initialize.params =
     and parse_window json = { status = Jget.obj_opt json "status" |> Base.Option.is_some }
     and parse_telemetry json =
       { connectionStatus = Jget.obj_opt json "connectionStatus" |> Base.Option.is_some }
+    and parse_experimental json =
+      { snippetTextEdit = Jget.bool_d json "snippetTextEdit" ~default:false }
     in
     parse_initialize params)
 
@@ -1159,6 +1188,20 @@ let print_initialize ~key (r : Initialize.result) : json =
     let print_textDocumentSyncKind kind = int_ (textDocumentSyncKind_to_enum kind) in
     let cap = r.server_capabilities in
     let sync = cap.textDocumentSync in
+    let experimental =
+      let { server_snippetTextEdit } = cap.server_experimental in
+      let props = [] in
+      let props =
+        if server_snippetTextEdit then
+          ("snippetTextEdit", JSON_Bool true) :: props
+        else
+          props
+      in
+      if Base.List.is_empty props then
+        None
+      else
+        Some (JSON_Object props)
+    in
     JSON_Object
       [
         ( "capabilities",
@@ -1228,6 +1271,7 @@ let print_initialize ~key (r : Initialize.result) : json =
               ("implementationProvider", Some (JSON_Bool cap.implementationProvider));
               ("typeCoverageProvider", Some (JSON_Bool cap.typeCoverageProvider));
               ("rageProvider", Some (JSON_Bool cap.rageProvider));
+              ("experimental", experimental);
             ] );
       ])
 
@@ -1371,6 +1415,7 @@ let request_name_to_string (request : lsp_request) : string =
   | RenameRequest _ -> "textDocument/rename"
   | DocumentCodeLensRequest _ -> "textDocument/codeLens"
   | ExecuteCommandRequest _ -> "workspace/executeCommand"
+  | ApplyWorkspaceEditRequest _ -> "workspace/applyEdit"
   | UnknownRequest (method_, _params) -> method_
 
 let result_name_to_string (result : lsp_result) : string =
@@ -1402,6 +1447,7 @@ let result_name_to_string (result : lsp_result) : string =
   | RenameResult _ -> "textDocument/rename"
   | DocumentCodeLensResult _ -> "textDocument/codeLens"
   | ExecuteCommandResult _ -> "workspace/executeCommand"
+  | ApplyWorkspaceEditResult _ -> "workspace/applyEdit"
   | RegisterCapabilityResult -> "client/registerCapability"
   | ErrorResult (e, _stack) -> "ERROR/" ^ e.Error.message
 
@@ -1468,8 +1514,9 @@ let parse_lsp_request (method_ : string) (params : json option) : lsp_request =
   | "workspace/executeCommand" -> ExecuteCommandRequest (parse_executeCommand params)
   | "workspace/configuration" -> ConfigurationRequest (ConfigurationFmt.params_of_json params)
   | "completionItem/resolve"
-  | "window/showMessageRequest"
-  | "window/showStatus"
+  | "window/showMessageRequest" (* server -> client, we should never receive this *)
+  | "window/showStatus" (* server -> client, we should never receive this *)
+  | "workspace/applyEdit" (* server -> client, we should never receive this *)
   | _ ->
     UnknownRequest (method_, params)
 
@@ -1501,6 +1548,8 @@ let parse_lsp_result (request : lsp_request) (result : json) : lsp_result =
   | ShowMessageRequestRequest _ ->
     ShowMessageRequestResult (parse_result_showMessageRequest (Some result))
   | ShowStatusRequest _ -> ShowStatusResult (parse_result_showMessageRequest (Some result))
+  | ApplyWorkspaceEditRequest _ ->
+    ApplyWorkspaceEditResult (ApplyWorkspaceEditFmt.result_of_json (Some result))
   | ConfigurationRequest _ -> ConfigurationResult (ConfigurationFmt.result_of_json (Some result))
   | RegisterCapabilityRequest _ -> RegisterCapabilityResult
   | InitializeRequest _
@@ -1565,6 +1614,7 @@ let print_lsp_request (id : lsp_id) (request : lsp_request) : json =
     | ShowMessageRequestRequest r -> print_showMessageRequest r
     | ShowStatusRequest r -> print_showStatus r
     | RegisterCapabilityRequest r -> RegisterCapabilityFmt.json_of_params r
+    | ApplyWorkspaceEditRequest r -> ApplyWorkspaceEditFmt.json_of_params r
     | ConfigurationRequest r -> ConfigurationFmt.json_of_params r
     | InitializeRequest _
     | ShutdownRequest
@@ -1626,6 +1676,7 @@ let print_lsp_response ?include_error_stack_trace ~key (id : lsp_id) (result : l
     | RenameResult r -> print_documentRename r
     | DocumentCodeLensResult r -> print_documentCodeLens ~key r
     | ExecuteCommandResult r -> print_executeCommand r
+    | ApplyWorkspaceEditResult r -> ApplyWorkspaceEditFmt.json_of_result r
     | SelectionRangeResult r -> SelectionRangeFmt.json_of_result r
     | SignatureHelpResult r -> SignatureHelpFmt.to_json r
     | ShowMessageRequestResult _

@@ -214,6 +214,8 @@ module CodeActionKind : sig
 
   val quickfix : t
 
+  val refactor : t
+
   val refactor_extract : t
 
   val source : t
@@ -307,6 +309,7 @@ module Initialize : sig
     textDocument: textDocumentClientCapabilities;
     window: windowClientCapabilities;
     telemetry: telemetryClientCapabilities;
+    experimental: experimentalClientCapabilities;
   }
 
   and workspaceClientCapabilities = {
@@ -347,6 +350,10 @@ module Initialize : sig
 
   and telemetryClientCapabilities = { connectionStatus: bool }
 
+  and experimentalClientCapabilities = { snippetTextEdit: bool }
+
+  and experimentalServerCapabilities = { server_snippetTextEdit: bool }
+
   and server_capabilities = {
     textDocumentSync: textDocumentSyncOptions;
     hoverProvider: bool;
@@ -368,6 +375,7 @@ module Initialize : sig
     executeCommandProvider: executeCommandOptions option;
     implementationProvider: bool;
     selectionRangeProvider: bool;
+    server_experimental: experimentalServerCapabilities;
     typeCoverageProvider: bool;
     rageProvider: bool;
   }
@@ -544,6 +552,19 @@ module TypeDefinition : sig
   type params = TextDocumentPositionParams.t
 
   and result = DefinitionLocation.t list
+end
+
+module ApplyWorkspaceEdit : sig
+  type params = {
+    label: string option;
+    edit: WorkspaceEdit.t;
+  }
+
+  and result = {
+    applied: bool;
+    failureReason: string option;
+    failedChange: int option;
+  }
 end
 
 module CodeAction : sig
@@ -1023,6 +1044,7 @@ type lsp_request =
   | RenameRequest of Rename.params
   | DocumentCodeLensRequest of DocumentCodeLens.params
   | ExecuteCommandRequest of ExecuteCommand.params
+  | ApplyWorkspaceEditRequest of ApplyWorkspaceEdit.params
   | UnknownRequest of string * Hh_json.json option
 
 type lsp_result =
@@ -1053,6 +1075,7 @@ type lsp_result =
   | RenameResult of Rename.result
   | DocumentCodeLensResult of DocumentCodeLens.result
   | ExecuteCommandResult of ExecuteCommand.result
+  | ApplyWorkspaceEditResult of ApplyWorkspaceEdit.result
   | RegisterCapabilityResult
   (* the string is a stacktrace *)
   | ErrorResult of Error.t * string
@@ -1088,6 +1111,7 @@ and 'a lsp_error_handler = Error.t * string -> 'a -> 'a
 and 'a lsp_result_handler =
   | ShowMessageHandler of (ShowMessageRequest.result -> 'a -> 'a)
   | ShowStatusHandler of (ShowStatus.result -> 'a -> 'a)
+  | ApplyWorkspaceEditHandler of (ApplyWorkspaceEdit.result -> 'a -> 'a)
   | ConfigurationHandler of (Configuration.result -> 'a -> 'a)
   | VoidHandler
 

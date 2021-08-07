@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  *)
 
-val client_supports_quickfixes : Lsp.CodeActionRequest.params -> bool
+val kind_is_supported : options:Options.t -> Lsp.CodeActionKind.t list option -> bool
 
 type text_edits = {
   title: string;
@@ -36,6 +36,7 @@ val ast_transform_of_error : ?loc:Loc.t -> Loc.t Error_message.t' -> ast_transfo
 
 val code_actions_at_loc :
   options:Options.t ->
+  lsp_init_params:Lsp.Initialize.params ->
   env:ServerEnv.env ->
   reader:Parsing_heaps.Reader.reader ->
   cx:Context.t ->
@@ -45,9 +46,19 @@ val code_actions_at_loc :
   typed_ast:(ALoc.t, ALoc.t * Type.t) Flow_ast.Program.t ->
   parse_errors:(Loc.t * Parse_error.t) Base.List.t ->
   diagnostics:Lsp.PublishDiagnostics.diagnostic list ->
+  only:Lsp.CodeActionKind.t list option ->
   uri:Lsp.DocumentUri.t ->
   loc:Loc.t ->
   (Lsp.CodeAction.command_or_action list, string) result Lwt.t
+
+val autofix_imports :
+  options:Options.t ->
+  env:ServerEnv.env ->
+  reader:Parsing_heaps.Reader.reader ->
+  cx:Context.t ->
+  ast:(Loc.t, Loc.t) Flow_ast.Program.t ->
+  uri:Lsp.DocumentUri.t ->
+  Lsp.TextEdit.t list
 
 val autofix_exports :
   options:Options.t ->

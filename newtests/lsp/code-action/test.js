@@ -359,7 +359,7 @@ export default (suite(
         ['textDocument/publishDiagnostics', ...lspIgnoreStatusAndCancellation],
       ),
     ]),
-    test('provide codeAction for PropMissing errors with bracket syntax', [
+    test('provide quickfix for PropMissing errors with bracket syntax', [
       addFile(
         'prop-missing-bracket-syntax.js.ignored',
         'prop-missing-bracket-syntax.js',
@@ -380,6 +380,7 @@ export default (suite(
           },
         },
         context: {
+          only: ['quickfix'],
           diagnostics: [
             {
               range: {
@@ -585,6 +586,7 @@ export default (suite(
           },
         },
         context: {
+          only: ['quickfix'],
           diagnostics: [
             {
               range: {
@@ -623,7 +625,12 @@ export default (suite(
           ],
         },
       }).verifyAllLSPMessagesInStep(
-        [{method: 'textDocument/codeAction', result: []}],
+        [
+          {
+            method: 'textDocument/codeAction',
+            result: [],
+          },
+        ],
         ['textDocument/publishDiagnostics', ...lspIgnoreStatusAndCancellation],
       ),
     ]),
@@ -726,7 +733,7 @@ export default (suite(
         ['textDocument/publishDiagnostics', ...lspIgnoreStatusAndCancellation],
       ),
     ]),
-    test('provide codeAction for ClassObject errors', [
+    test('provide quickfix for ClassObject errors', [
       addFile('class-object-subtype.js.ignored', 'class-object-subtype.js'),
       lspStartAndConnect(),
       lspRequestAndWaitUntilResponse('textDocument/codeAction', {
@@ -744,6 +751,7 @@ export default (suite(
           },
         },
         context: {
+          only: ['quickfix'],
           diagnostics: [
             {
               range: {
@@ -832,7 +840,7 @@ export default (suite(
         ],
       ),
     ]),
-    test('provide codeAction for nested ClassObject errors', [
+    test('provide quickfix for nested ClassObject errors', [
       addFile('class-object-subtype.js.ignored', 'class-object-subtype.js'),
       lspStartAndConnect(),
       lspRequestAndWaitUntilResponse('textDocument/codeAction', {
@@ -850,6 +858,7 @@ export default (suite(
           },
         },
         context: {
+          only: ['quickfix'],
           diagnostics: [
             {
               range: {
@@ -938,7 +947,7 @@ export default (suite(
         ],
       ),
     ]),
-    test('provide codeAction for aliased ClassObject errors', [
+    test('provide quickfix for aliased ClassObject errors', [
       addFile('class-object-subtype.js.ignored', 'class-object-subtype.js'),
       lspStartAndConnect(),
       lspRequestAndWaitUntilResponse('textDocument/codeAction', {
@@ -956,6 +965,7 @@ export default (suite(
           },
         },
         context: {
+          only: ['quickfix'],
           diagnostics: [
             {
               range: {
@@ -1063,6 +1073,7 @@ export default (suite(
           },
         },
         context: {
+          only: ['quickfix'],
           diagnostics: [
             {
               range: {
@@ -1169,6 +1180,7 @@ export default (suite(
           },
         },
         context: {
+          only: ['quickfix'],
           diagnostics: [
             {
               range: {
@@ -1313,6 +1325,7 @@ export default (suite(
           },
         },
         context: {
+          only: ['refactor'],
           diagnostics: [],
         },
       }).verifyAllLSPMessagesInStep(
@@ -1340,6 +1353,7 @@ export default (suite(
           },
         },
         context: {
+          only: ['refactor'],
           diagnostics: [],
         },
       }).verifyAllLSPMessagesInStep(
@@ -1426,7 +1440,7 @@ export default (suite(
                           },
                         },
                         newText:
-                          'function newFunction(): void {\n  console.log("foo");\n  console.log("bar");\n}',
+                          'function newFunction(): void {\n    console.log("foo");\n    console.log("bar");\n  }',
                       },
                     ],
                   },
@@ -1438,6 +1452,114 @@ export default (suite(
                     'textDocument/codeAction',
                     'refactor_extract',
                     "Extract to inner function in function 'fooBar'",
+                  ],
+                },
+              },
+            ],
+          },
+        ],
+        ['textDocument/publishDiagnostics', ...lspIgnoreStatusAndCancellation],
+      ),
+    ]),
+    test('provide codeAction for statements with comments', [
+      addFile(
+        'refactor-extract-with-comments.js.ignored',
+        'refactor-extract-with-comments.js',
+      ),
+      lspStartAndConnect(),
+      lspRequestAndWaitUntilResponse('textDocument/codeAction', {
+        textDocument: {
+          uri: '<PLACEHOLDER_PROJECT_URL>/refactor-extract-with-comments.js',
+        },
+        range: {
+          start: {
+            line: 3,
+            character: 2,
+          },
+          end: {
+            line: 6,
+            character: 26,
+          },
+        },
+        context: {
+          only: ['refactor'],
+          diagnostics: [],
+        },
+      }).verifyAllLSPMessagesInStep(
+        [
+          {
+            method: 'textDocument/codeAction',
+            result: [
+              {
+                title: 'Extract to function in module scope',
+                kind: 'refactor.extract',
+                diagnostics: [],
+                edit: {
+                  changes: {
+                    '<PLACEHOLDER_PROJECT_URL>/refactor-extract-with-comments.js': [
+                      {
+                        range: {
+                          start: {line: 3, character: 2},
+                          end: {line: 6, character: 26},
+                        },
+                        newText: 'let {a, barr, fooo} = newFunction();',
+                      },
+                      {
+                        range: {
+                          start: {line: 9, character: 1},
+                          end: {
+                            line: 9,
+                            character: 1,
+                          },
+                        },
+                        newText:
+                          '\nfunction newFunction(): {| a: number, barr: number, fooo: number |} {\n  // comment before\n  let fooo = 3; // selected\n  let barr = 4; // selected\n  const a = 3; // selected\n  return { a, barr, fooo };\n}',
+                      },
+                    ],
+                  },
+                },
+                command: {
+                  title: '',
+                  command: 'log:org.flow:<PLACEHOLDER_PROJECT_URL>',
+                  arguments: [
+                    'textDocument/codeAction',
+                    'refactor_extract',
+                    'Extract to function in module scope',
+                  ],
+                },
+              },
+              {
+                title: "Extract to inner function in function 'i_am_a_test'",
+                kind: 'refactor.extract',
+                diagnostics: [],
+                edit: {
+                  changes: {
+                    '<PLACEHOLDER_PROJECT_URL>/refactor-extract-with-comments.js': [
+                      {
+                        range: {
+                          start: {line: 3, character: 2},
+                          end: {line: 6, character: 26},
+                        },
+                        newText: 'let {a, barr, fooo} = newFunction();',
+                      },
+                      {
+                        range: {
+                          start: {line: 8, character: 15},
+                          end: {line: 8, character: 15},
+                        },
+                        newText:
+                          'function newFunction(): {| a: number, barr: number, fooo: number |} {\n    // comment before\n    let fooo = 3; // selected\n    let barr = 4; // selected\n    const a = 3; // selected\n    return { a, barr, fooo };\n  }',
+                      },
+                    ],
+                  },
+                },
+                command: {
+                  title: '',
+                  command: 'log:org.flow:<PLACEHOLDER_PROJECT_URL>',
+                  arguments: [
+                    'textDocument/codeAction',
+                    'refactor_extract',
+                    "Extract to inner function in function 'i_am_a_test'",
                   ],
                 },
               },
@@ -1464,6 +1586,7 @@ export default (suite(
         },
         range: {start: {line: 7, character: 2}, end: {line: 7, character: 19}},
         context: {
+          only: ['refactor'],
           diagnostics: [],
         },
       }).verifyAllLSPMessagesInStep(
@@ -1534,7 +1657,7 @@ export default (suite(
                           end: {line: 7, character: 19},
                         },
                         newText:
-                          '\nfunction newFunction(): void {\n  console.log(foo);\n}',
+                          '\nfunction newFunction(): void {\n    console.log(foo);\n  }',
                       },
                     ],
                   },
@@ -1561,6 +1684,7 @@ export default (suite(
         },
         range: {start: {line: 6, character: 2}, end: {line: 6, character: 24}},
         context: {
+          only: ['refactor'],
           diagnostics: [],
         },
       }).verifyAllLSPMessagesInStep(
@@ -1639,7 +1763,7 @@ export default (suite(
                           end: {line: 7, character: 19},
                         },
                         newText:
-                          'function newFunction(): Foo {\n  const foo = getFoo2();\n  return foo;\n}',
+                          'function newFunction(): Foo {\n    const foo = getFoo2();\n    return foo;\n  }',
                       },
                     ],
                   },
@@ -1651,6 +1775,438 @@ export default (suite(
                     'textDocument/codeAction',
                     'refactor_extract',
                     "Extract to inner function in function 'test'",
+                  ],
+                },
+              },
+            ],
+          },
+        ],
+        ['textDocument/publishDiagnostics', ...lspIgnoreStatusAndCancellation],
+      ),
+    ]),
+    test(
+      'provide codeAction for basic extract method, constant, class fields.',
+      [
+        addFile(
+          'refactor-extract-method.js.ignored',
+          'refactor-extract-method.js',
+        ),
+        lspStartAndConnect(),
+        // Partial selection is not allowed and gives no results.
+        lspRequestAndWaitUntilResponse('textDocument/codeAction', {
+          textDocument: {
+            uri: '<PLACEHOLDER_PROJECT_URL>/refactor-extract-method.js',
+          },
+          range: {
+            start: {line: 4, character: 4},
+            end: {line: 4, character: 16},
+          },
+          context: {
+            only: ['refactor'],
+            diagnostics: [],
+          },
+        }).verifyAllLSPMessagesInStep(
+          [
+            {
+              method: 'textDocument/codeAction',
+              result: [
+                {
+                  title: "Extract to method in class 'Test'",
+                  kind: 'refactor.extract',
+                  diagnostics: [],
+                  edit: {
+                    changes: {
+                      '<PLACEHOLDER_PROJECT_URL>/refactor-extract-method.js': [
+                        {
+                          range: {
+                            start: {line: 2, character: 0},
+                            end: {line: 6, character: 1},
+                          },
+                          newText:
+                            'class Test {\n  test(): void {\n    this.newMethod();\n  }\n  newMethod(): void {\n    this.test();\n  }\n}',
+                        },
+                      ],
+                    },
+                  },
+                  command: {
+                    title: '',
+                    command: 'log:org.flow:<PLACEHOLDER_PROJECT_URL>',
+                    arguments: [
+                      'textDocument/codeAction',
+                      'refactor_extract',
+                      "Extract to method in class 'Test'",
+                    ],
+                  },
+                },
+              ],
+            },
+          ],
+          [
+            'textDocument/publishDiagnostics',
+            ...lspIgnoreStatusAndCancellation,
+          ],
+        ),
+        lspRequestAndWaitUntilResponse('textDocument/codeAction', {
+          textDocument: {
+            uri: '<PLACEHOLDER_PROJECT_URL>/refactor-extract-method.js',
+          },
+          range: {
+            start: {line: 4, character: 4},
+            end: {line: 4, character: 15},
+          },
+          context: {
+            only: ['refactor'],
+            diagnostics: [],
+          },
+        }).verifyAllLSPMessagesInStep(
+          [
+            {
+              method: 'textDocument/codeAction',
+              result: [
+                {
+                  title: "Extract to field in class 'Test'",
+                  kind: 'refactor.extract',
+                  diagnostics: [],
+                  edit: {
+                    changes: {
+                      '<PLACEHOLDER_PROJECT_URL>/refactor-extract-method.js': [
+                        {
+                          range: {
+                            start: {line: 2, character: 0},
+                            end: {line: 6, character: 1},
+                          },
+                          newText:
+                            'class Test {\n  newProperty = this.test();\n  \n  test(): void {\n    this.newProperty;\n  }\n}',
+                        },
+                      ],
+                    },
+                  },
+                  command: {
+                    title: '',
+                    command: 'log:org.flow:<PLACEHOLDER_PROJECT_URL>',
+                    arguments: [
+                      'textDocument/codeAction',
+                      'refactor_extract',
+                      "Extract to field in class 'Test'",
+                    ],
+                  },
+                },
+                {
+                  title: "Extract to constant in method 'test'",
+                  kind: 'refactor.extract',
+                  diagnostics: [],
+                  edit: {
+                    changes: {
+                      '<PLACEHOLDER_PROJECT_URL>/refactor-extract-method.js': [
+                        {
+                          range: {
+                            start: {line: 4, character: 4},
+                            end: {line: 4, character: 16},
+                          },
+                          newText:
+                            'const newLocal = this.test();\n    \n    newLocal;',
+                        },
+                      ],
+                    },
+                  },
+                  command: {
+                    title: '',
+                    command: 'log:org.flow:<PLACEHOLDER_PROJECT_URL>',
+                    arguments: [
+                      'textDocument/codeAction',
+                      'refactor_extract',
+                      "Extract to constant in method 'test'",
+                    ],
+                  },
+                },
+              ],
+            },
+          ],
+          [
+            'textDocument/publishDiagnostics',
+            ...lspIgnoreStatusAndCancellation,
+          ],
+        ),
+      ],
+    ),
+    test('provide codeAction for basic extract type alias', [
+      addFile(
+        'refactor-extract-type-alias.js.ignored',
+        'refactor-extract-type-alias.js',
+      ),
+      lspStartAndConnect(),
+      lspRequestAndWaitUntilResponse('textDocument/codeAction', {
+        textDocument: {
+          uri: '<PLACEHOLDER_PROJECT_URL>/refactor-extract-type-alias.js',
+        },
+        range: {
+          start: {line: 3, character: 11},
+          end: {line: 3, character: 17},
+        },
+        context: {
+          only: ['refactor'],
+          diagnostics: [],
+        },
+      }).verifyAllLSPMessagesInStep(
+        [
+          {
+            method: 'textDocument/codeAction',
+            result: [
+              {
+                title: 'Extract to type alias',
+                kind: 'refactor.extract',
+                diagnostics: [],
+                edit: {
+                  changes: {
+                    '<PLACEHOLDER_PROJECT_URL>/refactor-extract-type-alias.js': [
+                      {
+                        range: {
+                          start: {
+                            line: 3,
+                            character: 2,
+                          },
+                          end: {
+                            line: 3,
+                            character: 22,
+                          },
+                        },
+                        newText:
+                          'type NewType = number;\n  \n  const a: NewType = 3;',
+                      },
+                    ],
+                  },
+                },
+                command: {
+                  title: '',
+                  command: 'log:org.flow:<PLACEHOLDER_PROJECT_URL>',
+                  arguments: [
+                    'textDocument/codeAction',
+                    'refactor_extract',
+                    'Extract to type alias',
+                  ],
+                },
+              },
+            ],
+          },
+        ],
+        ['textDocument/publishDiagnostics', ...lspIgnoreStatusAndCancellation],
+      ),
+    ]),
+    test('obey context.only', [
+      addFile('only-filter.js.ignored', 'only-filter.js'),
+      lspStartAndConnect(),
+      // no context.only gets back a quickfix and refactor
+      lspRequestAndWaitUntilResponse('textDocument/codeAction', {
+        textDocument: {
+          uri: '<PLACEHOLDER_PROJECT_URL>/only-filter.js',
+        },
+        range: {
+          start: {
+            line: 3,
+            character: 0,
+          },
+          end: {
+            line: 3,
+            character: 7,
+          },
+        },
+        context: {
+          diagnostics: [],
+        },
+      }).verifyAllLSPMessagesInStep(
+        [
+          {
+            method: 'textDocument/codeAction',
+            result: [
+              {
+                title: 'Extract to constant in module scope',
+                kind: 'refactor.extract',
+                diagnostics: [],
+                edit: {
+                  changes: {
+                    '<PLACEHOLDER_PROJECT_URL>/only-filter.js': [
+                      {
+                        range: {
+                          start: {
+                            line: 3,
+                            character: 0,
+                          },
+                          end: {
+                            line: 3,
+                            character: 8,
+                          },
+                        },
+                        newText: 'const newLocal = foo.bar;\n\nnewLocal;',
+                      },
+                    ],
+                  },
+                },
+                command: {
+                  title: '',
+                  command: 'log:org.flow:<PLACEHOLDER_PROJECT_URL>',
+                  arguments: [
+                    'textDocument/codeAction',
+                    'refactor_extract',
+                    'Extract to constant in module scope',
+                  ],
+                },
+              },
+              {
+                title:
+                  'Add optional chaining for object that might be `undefined`',
+                kind: 'quickfix',
+                diagnostics: [],
+                edit: {
+                  changes: {
+                    '<PLACEHOLDER_PROJECT_URL>/only-filter.js': [
+                      {
+                        range: {
+                          start: {
+                            line: 3,
+                            character: 0,
+                          },
+                          end: {
+                            line: 3,
+                            character: 7,
+                          },
+                        },
+                        newText: 'foo?.bar',
+                      },
+                    ],
+                  },
+                },
+                command: {
+                  title: '',
+                  command: 'log:org.flow:<PLACEHOLDER_PROJECT_URL>',
+                  arguments: [
+                    'textDocument/codeAction',
+                    'add_optional_chaining',
+                    'Add optional chaining for object that might be `undefined`',
+                  ],
+                },
+              },
+            ],
+          },
+        ],
+        ['textDocument/publishDiagnostics', ...lspIgnoreStatusAndCancellation],
+      ),
+      // context.only: ["refactor"] only gets the refactor
+      lspRequestAndWaitUntilResponse('textDocument/codeAction', {
+        textDocument: {
+          uri: '<PLACEHOLDER_PROJECT_URL>/only-filter.js',
+        },
+        range: {
+          start: {
+            line: 3,
+            character: 0,
+          },
+          end: {
+            line: 3,
+            character: 7,
+          },
+        },
+        context: {
+          diagnostics: [],
+          only: ['refactor'],
+        },
+      }).verifyAllLSPMessagesInStep(
+        [
+          {
+            method: 'textDocument/codeAction',
+            result: [
+              {
+                title: 'Extract to constant in module scope',
+                kind: 'refactor.extract',
+                diagnostics: [],
+                edit: {
+                  changes: {
+                    '<PLACEHOLDER_PROJECT_URL>/only-filter.js': [
+                      {
+                        range: {
+                          start: {
+                            line: 3,
+                            character: 0,
+                          },
+                          end: {
+                            line: 3,
+                            character: 8,
+                          },
+                        },
+                        newText: 'const newLocal = foo.bar;\n\nnewLocal;',
+                      },
+                    ],
+                  },
+                },
+                command: {
+                  title: '',
+                  command: 'log:org.flow:<PLACEHOLDER_PROJECT_URL>',
+                  arguments: [
+                    'textDocument/codeAction',
+                    'refactor_extract',
+                    'Extract to constant in module scope',
+                  ],
+                },
+              },
+            ],
+          },
+        ],
+        ['textDocument/publishDiagnostics', ...lspIgnoreStatusAndCancellation],
+      ),
+      // context.only: ["quickfix"] only gets the quickfix
+      lspRequestAndWaitUntilResponse('textDocument/codeAction', {
+        textDocument: {
+          uri: '<PLACEHOLDER_PROJECT_URL>/only-filter.js',
+        },
+        range: {
+          start: {
+            line: 3,
+            character: 0,
+          },
+          end: {
+            line: 3,
+            character: 7,
+          },
+        },
+        context: {
+          diagnostics: [],
+          only: ['quickfix'],
+        },
+      }).verifyAllLSPMessagesInStep(
+        [
+          {
+            method: 'textDocument/codeAction',
+            result: [
+              {
+                title:
+                  'Add optional chaining for object that might be `undefined`',
+                kind: 'quickfix',
+                diagnostics: [],
+                edit: {
+                  changes: {
+                    '<PLACEHOLDER_PROJECT_URL>/only-filter.js': [
+                      {
+                        range: {
+                          start: {
+                            line: 3,
+                            character: 0,
+                          },
+                          end: {
+                            line: 3,
+                            character: 7,
+                          },
+                        },
+                        newText: 'foo?.bar',
+                      },
+                    ],
+                  },
+                },
+                command: {
+                  title: '',
+                  command: 'log:org.flow:<PLACEHOLDER_PROJECT_URL>',
+                  arguments: [
+                    'textDocument/codeAction',
+                    'add_optional_chaining',
+                    'Add optional chaining for object that might be `undefined`',
                   ],
                 },
               },

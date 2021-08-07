@@ -7,6 +7,19 @@
 
 open Types_js_types
 
+let add_missing_imports_kind = Lsp.CodeActionKind.kind_of_string "source.addMissingImports.flow"
+
+let include_code_action ~only kind =
+  match only with
+  | None -> true
+  | Some only -> Base.List.exists ~f:(fun prefix -> Lsp.CodeActionKind.is_kind prefix kind) only
+
+let include_quick_fixes only = include_code_action ~only Lsp.CodeActionKind.quickfix
+
+let include_extract_refactors only = include_code_action ~only Lsp.CodeActionKind.refactor_extract
+
+let include_add_missing_imports_action only = include_code_action ~only add_missing_imports_kind
+
 let layout_options options =
   Js_layout_generator.
     {
@@ -43,47 +56,61 @@ let autofix_exports_code_actions
   else
     []
 
-let refactor_extract_code_actions ~options ~ast ~full_cx ~file_sig ~typed_ast ~reader uri loc =
-  if Options.refactor options then
-    match loc.Loc.source with
-    | None -> []
-    | Some file ->
-      let lsp_action_from_refactor { Refactor_extract.title; new_ast; added_imports } =
-        let diff = Insert_type.mk_diff ast new_ast in
-        let opts = layout_options options in
-        let edits =
-          Autofix_imports.add_imports ~options:opts ~added_imports ast
-          @ Replacement_printer.mk_loc_patch_ast_differ ~opts diff
-          |> Flow_lsp_conversions.flow_loc_patch_to_lsp_edits
+let refactor_extract_code_actions
+    ~options
+    ~support_experimental_snippet_text_edit
+    ~ast
+    ~full_cx
+    ~file_sig
+    ~typed_ast
+    ~reader
+    ~only
+    uri
+    loc =
+  if Options.refactor options && include_extract_refactors only then
+    if Loc.(loc.start = loc._end) then
+      []
+    else
+      match loc.Loc.source with
+      | None -> []
+      | Some file ->
+        let lsp_action_from_refactor { Refactor_extract.title; new_ast; added_imports } =
+          let diff = Insert_type.mk_diff ast new_ast in
+          let opts = layout_options options in
+          let edits =
+            Autofix_imports.add_imports ~options:opts ~added_imports ast
+            @ Replacement_printer.mk_loc_patch_ast_differ ~opts diff
+            |> Flow_lsp_conversions.flow_loc_patch_to_lsp_edits
+          in
+          let diagnostic_title = "refactor_extract" in
+          let open Lsp in
+          CodeAction.Action
+            {
+              CodeAction.title;
+              kind = CodeActionKind.refactor_extract;
+              diagnostics = [];
+              action =
+                CodeAction.BothEditThenCommand
+                  ( WorkspaceEdit.{ changes = UriMap.singleton uri edits },
+                    {
+                      Command.title = "";
+                      command = Command.Command "log";
+                      arguments =
+                        ["textDocument/codeAction"; diagnostic_title; title]
+                        |> List.map (fun str -> Hh_json.JSON_String str);
+                    } );
+            }
         in
-        let diagnostic_title = "refactor_extract" in
-        let open Lsp in
-        CodeAction.Action
-          {
-            CodeAction.title;
-            kind = CodeActionKind.refactor_extract;
-            diagnostics = [];
-            action =
-              CodeAction.BothEditThenCommand
-                ( WorkspaceEdit.{ changes = UriMap.singleton uri edits },
-                  {
-                    Command.title = "";
-                    command = Command.Command "log";
-                    arguments =
-                      ["textDocument/codeAction"; diagnostic_title; title]
-                      |> List.map (fun str -> Hh_json.JSON_String str);
-                  } );
-          }
-      in
-      Refactor_extract.provide_available_refactors
-        ~ast
-        ~full_cx
-        ~file
-        ~file_sig:(File_sig.abstractify_locs file_sig)
-        ~typed_ast
-        ~reader
-        ~extract_range:loc
-      |> List.map lsp_action_from_refactor
+        Refactor_extract.provide_available_refactors
+          ~ast
+          ~full_cx
+          ~file
+          ~file_sig:(File_sig.abstractify_locs file_sig)
+          ~typed_ast
+          ~reader
+          ~support_experimental_snippet_text_edit
+          ~extract_range:loc
+        |> List.map lsp_action_from_refactor
   else
     []
 
@@ -177,22 +204,25 @@ type text_edits = {
   from: string;
 }
 
-let text_edits_of_import ~options ~reader ~src_dir ~ast kind name source =
-  let from =
-    match source with
-    | Export_index.Global -> None
-    | Export_index.Builtin from -> Some from
-    | Export_index.File_key from ->
-      (match Module_heaps.Reader.get_info ~reader ~audit:Expensive.ok from with
+(** Generates the 'from' part of 'import ... from ...' required to import [source] from
+    a file in [src_dir] *)
+let from_of_source ~options ~reader ~src_dir source =
+  match source with
+  | Export_index.Global -> None
+  | Export_index.Builtin from -> Some from
+  | Export_index.File_key from ->
+    (match Module_heaps.Reader.get_info ~reader ~audit:Expensive.ok from with
+    | None -> None
+    | Some info ->
+      let node_resolver_dirnames = Options.file_options options |> Files.node_resolver_dirnames in
+      (match
+         path_of_modulename ~node_resolver_dirnames ~reader src_dir info.Module_heaps.module_name
+       with
       | None -> None
-      | Some info ->
-        let node_resolver_dirnames = Options.file_options options |> Files.node_resolver_dirnames in
-        (match
-           path_of_modulename ~node_resolver_dirnames ~reader src_dir info.Module_heaps.module_name
-         with
-        | None -> None
-        | Some from -> Some from))
-  in
+      | Some from -> Some from))
+
+let text_edits_of_import ~options ~reader ~src_dir ~ast kind name source =
+  let from = from_of_source ~options ~reader ~src_dir source in
   match from with
   | None -> None
   | Some from ->
@@ -218,6 +248,19 @@ let text_edits_of_import ~options ~reader ~src_dir ~ast kind name source =
       |> Flow_lsp_conversions.flow_loc_patch_to_lsp_edits
     in
     Some { title; edits; from }
+
+let preferred_import ~ast ~exports name loc =
+  let files =
+    if Autofix_imports.loc_is_type ~ast loc then
+      Export_search.get_types name exports
+    else
+      Export_search.get_values name exports
+  in
+  if Export_index.ExportSet.cardinal files = 1 then
+    (* there must be exactly 1 result to autofix it *)
+    Some (Export_index.ExportSet.choose files)
+  else
+    None
 
 let suggest_imports ~options ~reader ~ast ~diagnostics ~exports ~name uri loc =
   let open Lsp in
@@ -403,47 +446,79 @@ let ast_transform_of_error ?loc = function
       | _ -> None)
     | _ -> None)
 
-let code_actions_of_errors ~options ~reader ~env ~ast ~diagnostics ~errors uri loc =
-  Flow_error.ErrorSet.fold
-    (fun error actions ->
-      match
-        Flow_error.msg_of_error error
-        |> Error_message.map_loc_of_error_message (Parsing_heaps.Reader.loc_of_aloc ~reader)
-      with
-      | Error_message.EBuiltinLookupFailed { reason; name = Some name }
-        when Options.autoimports options ->
-        let error_loc = Reason.loc_of_reason reason in
-        if Loc.intersects error_loc loc then
-          let { ServerEnv.exports; _ } = env in
-          suggest_imports
-            ~options
-            ~reader
-            ~ast
-            ~diagnostics
-            ~exports (* TODO consider filtering out internal names *)
-            ~name:(Reason.display_string_of_name name)
-            uri
-            loc
-          @ actions
-        else
-          actions
-      | error_message ->
-        (match ast_transform_of_error ~loc error_message with
-        | None -> actions
-        | Some { title; diagnostic_title; transform; target_loc } ->
-          autofix_in_upstream_file
-            ~reader
-            ~diagnostics
-            ~ast
-            ~options
-            ~title
-            ~diagnostic_title
-            ~transform
-            uri
-            target_loc
-          :: actions))
-    errors
-    []
+let code_actions_of_errors ~options ~reader ~env ~ast ~diagnostics ~errors ~only uri loc =
+  let include_quick_fixes = include_quick_fixes only in
+  let (actions, has_missing_import) =
+    Flow_error.ErrorSet.fold
+      (fun error (actions, has_missing_import) ->
+        match
+          Flow_error.msg_of_error error
+          |> Error_message.map_loc_of_error_message (Parsing_heaps.Reader.loc_of_aloc ~reader)
+        with
+        | Error_message.EBuiltinLookupFailed { reason; name = Some name }
+          when Options.autoimports options ->
+          let error_loc = Reason.loc_of_reason reason in
+          let actions =
+            if include_quick_fixes && Loc.intersects error_loc loc then
+              let { ServerEnv.exports; _ } = env in
+              suggest_imports
+                ~options
+                ~reader
+                ~ast
+                ~diagnostics
+                ~exports (* TODO consider filtering out internal names *)
+                ~name:(Reason.display_string_of_name name)
+                uri
+                loc
+              @ actions
+            else
+              actions
+          in
+          (actions, true)
+        | error_message ->
+          let actions =
+            if include_quick_fixes then
+              match ast_transform_of_error ~loc error_message with
+              | None -> actions
+              | Some { title; diagnostic_title; transform; target_loc } ->
+                autofix_in_upstream_file
+                  ~reader
+                  ~diagnostics
+                  ~ast
+                  ~options
+                  ~title
+                  ~diagnostic_title
+                  ~transform
+                  uri
+                  target_loc
+                :: actions
+            else
+              actions
+          in
+          (actions, has_missing_import))
+      errors
+      ([], false)
+  in
+  if include_add_missing_imports_action only && has_missing_import then
+    let open Lsp in
+    CodeAction.Action
+      {
+        CodeAction.title = "Add all missing imports";
+        kind = add_missing_imports_kind;
+        diagnostics = [];
+        action =
+          CodeAction.CommandOnly
+            {
+              Command.title = "";
+              command = Command.Command "source.addMissingImports";
+              arguments =
+                (* Lsp.TextDocumentIdentifier *)
+                [Hh_json.JSON_Object [("uri", Hh_json.JSON_String (Lsp.DocumentUri.to_string uri))]];
+            };
+      }
+    :: actions
+  else
+    actions
 
 let code_actions_of_parse_errors ~diagnostics ~uri ~loc parse_errors =
   Base.List.fold_left
@@ -481,14 +556,25 @@ let code_actions_of_parse_errors ~diagnostics ~uri ~loc parse_errors =
     ~init:[]
     parse_errors
 
-(** currently all of our code actions are quickfixes, so we can short circuit if the client
-    doesn't support those. *)
-let client_supports_quickfixes params =
-  let Lsp.CodeActionRequest.{ context = { only; _ }; _ } = params in
-  Lsp.CodeActionKind.contains_kind_opt ~default:true Lsp.CodeActionKind.quickfix only
+(** List of code actions we implement. *)
+let supported_code_actions options =
+  let actions = [Lsp.CodeActionKind.quickfix; add_missing_imports_kind] in
+  if Options.refactor options then
+    Lsp.CodeActionKind.refactor_extract :: actions
+  else
+    actions
+
+(** Determines if at least one of the kinds in [only] is supported. *)
+let kind_is_supported ~options only =
+  match only with
+  | None -> true
+  | Some only ->
+    let supported = supported_code_actions options in
+    Base.List.exists ~f:(fun kind -> Lsp.CodeActionKind.contains_kind kind supported) only
 
 let code_actions_at_loc
     ~options
+    ~lsp_init_params
     ~env
     ~reader
     ~cx
@@ -498,6 +584,7 @@ let code_actions_at_loc
     ~typed_ast
     ~parse_errors
     ~diagnostics
+    ~only
     ~uri
     ~loc =
   let experimental_code_actions =
@@ -511,7 +598,18 @@ let code_actions_at_loc
       ~diagnostics
       uri
       loc
-    @ refactor_extract_code_actions ~options ~ast ~full_cx:cx ~file_sig ~typed_ast ~reader uri loc
+    @ refactor_extract_code_actions
+        ~options
+        ~support_experimental_snippet_text_edit:
+          (Lsp_helpers.supports_experimental_snippet_text_edit lsp_init_params)
+        ~ast
+        ~full_cx:cx
+        ~file_sig
+        ~typed_ast
+        ~reader
+        ~only
+        uri
+        loc
   in
   let error_fixes =
     code_actions_of_errors
@@ -521,22 +619,118 @@ let code_actions_at_loc
       ~ast
       ~diagnostics
       ~errors:(Context.errors cx)
+      ~only
       uri
       loc
   in
   let parse_error_fixes = code_actions_of_parse_errors ~diagnostics ~uri ~loc parse_errors in
   Lwt.return (Ok (parse_error_fixes @ experimental_code_actions @ error_fixes))
 
+module ExportSourceMap = WrappedMap.Make (struct
+  type t = Export_index.source
+
+  let compare = Export_index.compare_source
+end)
+
+module ExportKindMap = WrappedMap.Make (struct
+  type t = Export_index.kind
+
+  let compare = Export_index.compare_kind
+end)
+
+(** insert imports for all undefined-variable errors that have only one suggestion *)
+let autofix_imports ~options ~env ~reader ~cx ~ast ~uri =
+  let errors = Context.errors cx in
+  let { ServerEnv.exports; _ } = env in
+  let src_dir = Lsp_helpers.lsp_uri_to_path uri |> Filename.dirname |> Base.Option.return in
+  (* collect imports for all of the undefined variables in the file *)
+  let imports =
+    Flow_error.ErrorSet.fold
+      (fun error imports ->
+        match
+          Flow_error.msg_of_error error
+          |> Error_message.map_loc_of_error_message (Parsing_heaps.Reader.loc_of_aloc ~reader)
+        with
+        | Error_message.EBuiltinLookupFailed { reason; name = Some name }
+          when Options.autoimports options ->
+          let name = Reason.display_string_of_name name in
+          let error_loc = Reason.loc_of_reason reason in
+          (match preferred_import ~ast ~exports name error_loc with
+          | Some (source, export_kind) ->
+            let bindings =
+              match ExportSourceMap.find_opt source imports with
+              | None -> ExportKindMap.empty
+              | Some prev -> prev
+            in
+            let names =
+              match ExportKindMap.find_opt export_kind bindings with
+              | None -> [name]
+              | Some prev -> name :: prev
+            in
+            ExportSourceMap.add source (ExportKindMap.add export_kind names bindings) imports
+          | None -> imports)
+        | _ -> imports)
+      errors
+      ExportSourceMap.empty
+  in
+  let added_imports =
+    ExportSourceMap.fold
+      (fun source names_of_kinds added_imports ->
+        let from = from_of_source ~options ~reader ~src_dir source in
+        match from with
+        | None -> added_imports
+        | Some from ->
+          ExportKindMap.fold
+            (fun export_kind names added_imports ->
+              match export_kind with
+              | Export_index.Default ->
+                Base.List.fold_left
+                  ~init:added_imports
+                  ~f:(fun added_imports name ->
+                    (from, Autofix_imports.Default name) :: added_imports)
+                  names
+              | Export_index.Named ->
+                let named_bindings =
+                  Base.List.map
+                    ~f:(fun name -> { Autofix_imports.remote_name = name; local_name = None })
+                    names
+                in
+                (from, Autofix_imports.Named named_bindings) :: added_imports
+              | Export_index.NamedType ->
+                let named_bindings =
+                  Base.List.map
+                    ~f:(fun name -> { Autofix_imports.remote_name = name; local_name = None })
+                    names
+                in
+                (from, Autofix_imports.NamedType named_bindings) :: added_imports
+              | Export_index.Namespace ->
+                Base.List.fold_left
+                  ~init:added_imports
+                  ~f:(fun added_imports name ->
+                    (from, Autofix_imports.Namespace name) :: added_imports)
+                  names)
+            names_of_kinds
+            added_imports)
+      imports
+      []
+  in
+  let edits =
+    let opts = layout_options options in
+    Autofix_imports.add_imports ~options:opts ~added_imports ast
+    |> Flow_lsp_conversions.flow_loc_patch_to_lsp_edits
+  in
+  edits
+
 let autofix_exports ~options ~env ~profiling ~file_key ~file_content =
   let open Autofix_exports in
   let%lwt file_artifacts =
     let%lwt ((_, parse_errs) as intermediate_result) =
-      Types_js.parse_contents ~options ~profiling file_content file_key
+      Type_contents.parse_contents ~options ~profiling file_content file_key
     in
     if not (Flow_error.ErrorSet.is_empty parse_errs) then
       Lwt.return (Error parse_errs)
     else
-      Types_js.type_parse_artifacts ~options ~env ~profiling file_key intermediate_result
+      Type_contents.type_parse_artifacts ~options ~env ~profiling file_key intermediate_result
   in
   match file_artifacts with
   | Ok
@@ -564,7 +758,7 @@ let insert_type
   let open Insert_type in
   let%lwt file_artifacts =
     let%lwt ((_, parse_errs) as intermediate_result) =
-      Types_js.parse_contents ~options ~profiling file_content file_key
+      Type_contents.parse_contents ~options ~profiling file_content file_key
     in
     (* It's not clear to me (nmote) that we actually should abort when we see parse errors. Maybe
      * we should continue on here. I'm inserting this logic during the migration away from
@@ -572,7 +766,7 @@ let insert_type
     if not (Flow_error.ErrorSet.is_empty parse_errs) then
       Lwt.return (Error parse_errs)
     else
-      Types_js.type_parse_artifacts ~options ~env ~profiling file_key intermediate_result
+      Type_contents.type_parse_artifacts ~options ~env ~profiling file_key intermediate_result
   in
   match file_artifacts with
   | Ok (Parse_artifacts { ast; file_sig; _ }, Typecheck_artifacts { cx = full_cx; typed_ast }) ->
@@ -598,22 +792,26 @@ let insert_type
     Lwt.return result
   | Error _ as result ->
     let (errs, _) =
-      Types_js.printable_errors_of_file_artifacts_result ~options ~env file_key result
+      Type_contents.printable_errors_of_file_artifacts_result ~options ~env file_key result
     in
     Lwt.return (Error (error_to_string (Expected (FailedToTypeCheck errs))))
 
 let suggest ~options ~env ~profiling file_key file_content =
   let%lwt file_artifacts_result =
     let%lwt ((_, parse_errs) as intermediate_result) =
-      Types_js.parse_contents ~options ~profiling file_content file_key
+      Type_contents.parse_contents ~options ~profiling file_content file_key
     in
     if not (Flow_error.ErrorSet.is_empty parse_errs) then
       Lwt.return (Error parse_errs)
     else
-      Types_js.type_parse_artifacts ~options ~env ~profiling file_key intermediate_result
+      Type_contents.type_parse_artifacts ~options ~env ~profiling file_key intermediate_result
   in
   let (tc_errors, tc_warnings) =
-    Types_js.printable_errors_of_file_artifacts_result ~options ~env file_key file_artifacts_result
+    Type_contents.printable_errors_of_file_artifacts_result
+      ~options
+      ~env
+      file_key
+      file_artifacts_result
   in
   match file_artifacts_result with
   | Ok (Parse_artifacts { ast; file_sig; _ }, Typecheck_artifacts { cx; typed_ast = tast }) ->

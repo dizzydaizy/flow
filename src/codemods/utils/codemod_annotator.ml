@@ -73,6 +73,57 @@ module HardCodedImportMap = struct
                } ))
 end
 
+(* Used to infer the type for an annotation from an error loc *)
+let get_ty cctx ~preserve_literals ~max_type_size loc =
+  let preserve_inferred_literal_types =
+    Codemod_hardcoded_ty_fixes.PreserveLiterals.(
+      match preserve_literals with
+      | Always
+      | Auto ->
+        true
+      | Never -> false)
+  in
+  let norm_opts =
+    {
+      Ty_normalizer_env.expand_internal_types = false;
+      expand_type_aliases = false;
+      flag_shadowed_type_params = false;
+      preserve_inferred_literal_types;
+      evaluate_type_destructors = false;
+      optimize_types = false;
+      omit_targ_defaults = true;
+      merge_bot_and_any_kinds = false;
+      verbose_normalizer = false;
+      max_depth = None;
+    }
+  in
+  let validate_ty ty =
+    let reader = cctx.Codemod_context.Typed.reader in
+    let loc_of_aloc = Parsing_heaps.Reader_dispatcher.loc_of_aloc ~reader in
+    (* NOTE simplify before validating to avoid flagging spurious empty's,
+     * eg. empty's that will be simplified away as parts of unions.
+     * Do not simplify empties. Ignoring some of the attendant upper bounds
+     * might lead to unsound types.
+     *)
+    let ty = Ty_utils.simplify_type ~merge_kinds:false ty in
+    match Validator.validate_type ~size_limit:max_type_size ~loc_of_aloc ty with
+    | (ty, []) -> Ok ty
+    | (ty, errs) ->
+      let errs = List.map (fun e -> Error.Validation_error e) errs in
+      Error (errs, ty)
+  in
+  match Codemod_context.Typed.ty_at_loc norm_opts cctx loc with
+  | Ok (Ty.Type ty) -> validate_ty ty
+  | Ok (Ty.Decl (Ty.ClassDecl (s, _))) -> validate_ty (Ty.TypeOf (Ty.TSymbol s))
+  | Ok _ ->
+    let ty = Ty.explicit_any in
+    let errors = [Error.Missing_annotation_or_normalizer_error] in
+    Error (errors, ty)
+  | Error _ ->
+    let ty = Ty.explicit_any in
+    let errors = [Error.Missing_annotation_or_normalizer_error] in
+    Error (errors, ty)
+
 module Make (Extra : BASE_STATS) = struct
   module Stats = Stats (Extra)
   module Acc = Acc (Extra)
@@ -238,6 +289,40 @@ module Make (Extra : BASE_STATS) = struct
             ) else
               x
           | (None, Ok ty) -> this#opt_annotate_inferred_type ~f ~error loc (Ty_ ty) x
+
+      (* Useful to annotate expressions with a typecast. Skips arrow functions *)
+      method private annotate_expr loc expression ty =
+        let open Ast.Expression in
+        match expression with
+        | (arrow_loc, ArrowFunction _func) ->
+          this#update_acc (fun acc -> Acc.warn acc arrow_loc Warning.Skipping_arrow_function);
+          Ok expression
+        | (expr_loc, _) ->
+          Acc.debug expr_loc (Debug.Add_annotation Debug.Expr);
+          this#annotate_node loc ty (fun annot ->
+              (expr_loc, TypeCast TypeCast.{ expression; annot; comments = None }))
+
+      method private add_unannotated_loc_warnings lmap =
+        let not_annotated_locs =
+          LMap.fold
+            (fun loc _ acc ->
+              if LMap.mem loc added_annotations_locmap then
+                (* we added an annot *)
+                acc
+              else if LSet.mem loc wont_annotate_locs then
+                (* we are explicitly avoiding it *)
+                acc
+              else if LSet.mem loc codemod_error_locs then
+                (* codemod error *)
+                acc
+              else
+                loc :: acc)
+            lmap
+            []
+        in
+        List.iter
+          (fun loc -> this#update_acc (fun acc -> Acc.warn acc loc Warning.Location_unhandled))
+          not_annotated_locs
 
       method virtual private post_run : unit -> Extra.t
 
